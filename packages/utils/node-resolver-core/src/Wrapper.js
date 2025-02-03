@@ -41,6 +41,10 @@ const SOURCE = 1 << 2;
 const BROWSER = 1 << 3;
 const TYPES = 1 << 6;
 
+const IS_FILE = 1 << 0;
+const IS_DIR = 1 << 1;
+const IS_SYMLINK = 1 << 2;
+
 type Options = {|
   fs: FileSystem,
   projectRoot: FilePath,
@@ -90,10 +94,26 @@ export default class NodeResolver {
           !init
             ? undefined
             : {
-                canonicalize: path => this.options.fs.realpathSync(path),
                 read: path => this.options.fs.readFileSync(path),
-                isFile: path => this.options.fs.statSync(path).isFile(),
-                isDir: path => this.options.fs.statSync(path).isDirectory(),
+                kind: path => {
+                  let flags = 0;
+                  try {
+                    let stat = this.options.fs.lstatSync(path);
+                    if (stat.isSymbolicLink()) {
+                      flags |= IS_SYMLINK;
+                      stat = this.options.fs.statSync(path);
+                    }
+                    if (stat.isFile()) {
+                      flags |= IS_FILE;
+                    } else if (stat.isDirectory()) {
+                      flags |= IS_DIR;
+                    }
+                  } catch (err) {
+                    // ignore
+                  }
+                  return flags;
+                },
+                readLink: path => this.options.fs.readlinkSync(path),
               },
         mode: 1,
         includeNodeModules: options.env.includeNodeModules,
@@ -105,7 +125,10 @@ export default class NodeResolver {
           options.env,
           this.options.mode,
         ),
-        packageExports: this.options.packageExports ?? false,
+        packageExports:
+          this.options.packageExports ||
+          options.env.context === 'react-server' ||
+          options.env.context === 'react-client',
         moduleDirResolver:
           process.versions.pnp != null
             ? (module, from) => {
@@ -165,7 +188,7 @@ export default class NodeResolver {
           ? diagnostic
           : diagnostic
           ? [diagnostic]
-          : [],
+          : undefined,
         invalidateOnFileCreate: res.invalidateOnFileCreate,
         invalidateOnFileChange: res.invalidateOnFileChange,
       };
@@ -232,7 +255,7 @@ export default class NodeResolver {
     name: string,
     options: ResolveOptions,
   ): Promise<?ResolveResult> {
-    if (options.env.isNode()) {
+    if (options.env.isNode() || options.env.context === 'react-server') {
       return {isExcluded: true};
     }
 
@@ -759,8 +782,10 @@ function environmentToExportsConditions(
   const ELECTRON = 1 << 7;
   const DEVELOPMENT = 1 << 8;
   const PRODUCTION = 1 << 9;
+  const REACT_SERVER = 1 << 16;
+  const SOURCE = 1 << 17;
 
-  let conditions = 0;
+  let conditions = SOURCE;
   if (env.isBrowser()) {
     conditions |= BROWSER;
   }
@@ -779,6 +804,10 @@ function environmentToExportsConditions(
 
   if (env.isNode()) {
     conditions |= NODE;
+  }
+
+  if (env.context === 'react-server') {
+    conditions |= REACT_SERVER;
   }
 
   if (mode === 'production') {

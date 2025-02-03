@@ -1,18 +1,21 @@
 import assert from 'assert';
 import {
+  assertBundles,
   bundle,
   bundler,
-  assertBundles,
-  removeDistDirectory,
   distDir,
   getNextBuild,
+  removeDistDirectory,
   run,
   inputFS,
   outputFS,
   overlayFS,
   ncp,
+  fsFixture,
 } from '@parcel/test-utils';
 import path from 'path';
+import Logger from '@parcel/logger';
+import {md} from '@parcel/diagnostic';
 
 describe('html', function () {
   beforeEach(async () => {
@@ -455,12 +458,7 @@ describe('html', function () {
       },
       {
         type: 'js',
-        assets: [
-          'index.css',
-          'bundle-url.js',
-          'css-loader.js',
-          'hmr-runtime.js',
-        ],
+        assets: ['index.css', 'css-loader.js', 'hmr-runtime.js'],
       },
     ]);
 
@@ -504,7 +502,7 @@ describe('html', function () {
     );
 
     assert(
-      /^<link rel="stylesheet" href="[/\\]index\.[a-f0-9]+\.css">\s*<script src="[/\\]index\.[a-f0-9]+\.js" defer=""><\/script>\s*<h1>Hello/m.test(
+      /^<link rel="stylesheet" href="[/\\]index\.[a-f0-9]+\.css">\s*<script type="module" src="[/\\]index\.[a-f0-9]+\.js"><\/script>\s*<h1>Hello/m.test(
         html,
       ),
     );
@@ -547,7 +545,7 @@ describe('html', function () {
     );
 
     assert.equal(
-      html.match(/<script src="[/\\]{1}index\.[a-f0-9]+?\.js" defer="">/g)
+      html.match(/<script type="module" src="[/\\]{1}index\.[a-f0-9]+?\.js">/g)
         .length,
       2,
     );
@@ -676,6 +674,83 @@ describe('html', function () {
         '<svg version=1.1 baseprofile=full width=300 height=200 xmlns=http://www.w3.org/2000/svg><rect width=100% height=100% fill=red></rect><circle cx=150 cy=100 r=80 fill=green></circle><text x=150 y=125 font-size=60 text-anchor=middle fill=white>SVG</text></svg>',
       ),
     );
+  });
+
+  it('should detect the version of SVGO to use', async function () {
+    // Test is outside parcel so that svgo is not already installed.
+    await fsFixture(overlayFS, '/')`
+      htmlnano-svgo-version
+        index.html:
+          <!DOCTYPE html>
+          <html>
+            <body>
+              <svg><rect id="test" /></svg>
+            </body>
+          </html>
+
+        .htmlnanorc:
+          {
+            "minifySvg": {
+              "full": true
+            }
+          }
+
+        yarn.lock:
+    `;
+
+    let messages = [];
+    let loggerDisposable = Logger.onLog(message => {
+      if (message.level !== 'verbose') {
+        messages.push(message);
+      }
+    });
+
+    try {
+      await bundle(path.join('/htmlnano-svgo-version/index.html'), {
+        inputFS: overlayFS,
+        defaultTargetOptions: {
+          shouldOptimize: true,
+        },
+        shouldAutoinstall: false,
+      });
+    } catch (err) {
+      // autoinstall is disabled
+      assert.equal(
+        err.diagnostics[0].message,
+        md`Could not resolve module "svgo" from "${path.resolve(
+          overlayFS.cwd(),
+          '/htmlnano-svgo-version/index',
+        )}"`,
+      );
+    }
+
+    loggerDisposable.dispose();
+    assert(
+      messages[0].diagnostics[0].message.startsWith(
+        'Detected deprecated SVGO v2 options in',
+      ),
+    );
+    assert.deepEqual(messages[0].diagnostics[0].codeFrames, [
+      {
+        filePath: path.resolve(
+          overlayFS.cwd(),
+          '/htmlnano-svgo-version/.htmlnanorc',
+        ),
+        codeHighlights: [
+          {
+            message: undefined,
+            start: {
+              line: 3,
+              column: 5,
+            },
+            end: {
+              line: 3,
+              column: 16,
+            },
+          },
+        ],
+      },
+    ]);
   });
 
   it('should not minify default values inside HTML in production mode', async function () {
@@ -1000,7 +1075,7 @@ describe('html', function () {
     let contents = await outputFS.readFile(b.getBundles()[0].filePath, 'utf8');
     assert(
       contents.includes(
-        '<svg><symbol id="all"><rect width="100" height="100"/></symbol></svg><svg><use xlink:href="#all" href="#all"/></svg>',
+        '<svg><symbol id="all"><rect width="100" height="100"/></symbol></svg><svg><use href="#all"/></svg>',
       ),
     );
   });
@@ -1654,30 +1729,6 @@ describe('html', function () {
     assert(!/class \$[a-f0-9]+\$var\$Useless \{/.test(js));
   });
 
-  it('should remove type="module" when not scope hoisting', async function () {
-    let b = await bundle(
-      path.join(__dirname, '/integration/html-js/index.html'),
-    );
-
-    await assertBundles(b, [
-      {
-        type: 'js',
-        assets: ['esmodule-helpers.js', 'index.js', 'other.js'],
-      },
-      {
-        name: 'index.html',
-        assets: ['index.html'],
-      },
-    ]);
-
-    let html = await outputFS.readFile(
-      path.join(distDir, 'index.html'),
-      'utf8',
-    );
-    assert(!html.includes('<script type="module"'));
-    assert(html.includes('<script src='));
-  });
-
   it('should not add a nomodule version when all browsers support esmodules', async function () {
     let b = await bundle(
       path.join(__dirname, '/integration/html-js/index.html'),
@@ -1791,8 +1842,6 @@ describe('html', function () {
       {
         type: 'js',
         assets: [
-          'bundle-manifest.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'index.js',
           'index.js',
@@ -1802,13 +1851,7 @@ describe('html', function () {
       },
       {
         type: 'js',
-        assets: [
-          'bundle-manifest.js',
-          'esm-js-loader.js',
-          'index.js',
-          'index.js',
-          'index.js',
-        ],
+        assets: ['index.js', 'index.js', 'index.js'],
       },
       {
         name: 'index.html',
@@ -1887,13 +1930,7 @@ describe('html', function () {
       },
       {
         type: 'js',
-        assets: [
-          'bundle-manifest.js',
-          'esm-js-loader.js',
-          'get-worker-url.js',
-          'index.js',
-          'lodash.js',
-        ],
+        assets: ['get-worker-url.js', 'index.js', 'lodash.js'],
       },
       {
         name: 'index.html',
@@ -1949,13 +1986,7 @@ describe('html', function () {
       },
       {
         type: 'js',
-        assets: [
-          'bundle-manifest.js',
-          'esm-js-loader.js',
-          'get-worker-url.js',
-          'index.js',
-          'lodash.js',
-        ],
+        assets: ['get-worker-url.js', 'index.js', 'lodash.js'],
       },
       {
         name: 'index.html',
@@ -2104,13 +2135,7 @@ describe('html', function () {
       },
       {
         type: 'js',
-        assets: [
-          'bundle-manifest.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'index.js',
-          'js-loader.js',
-        ],
+        assets: ['index.js'],
       },
       {
         type: 'js',
@@ -2127,13 +2152,7 @@ describe('html', function () {
       },
       {
         type: 'js',
-        assets: [
-          'bundle-manifest.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'index.js',
-          'js-loader.js',
-        ],
+        assets: ['index.js'],
       },
     ]);
   });
@@ -2191,25 +2210,13 @@ describe('html', function () {
         assets: ['index.html'],
       },
       {
-        assets: ['a.js', 'bundle-manifest.js', 'esm-js-loader.js'],
+        assets: ['a.js'],
       },
       {
-        assets: [
-          'a.js',
-          'bundle-manifest.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'js-loader.js',
-        ],
+        assets: ['a.js', 'cacheLoader.js', 'js-loader.js'],
       },
       {
-        assets: [
-          'b.js',
-          'bundle-manifest.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'js-loader.js',
-        ],
+        assets: ['b.js', 'cacheLoader.js', 'js-loader.js'],
       },
       {
         assets: ['c.js'],
@@ -2312,15 +2319,7 @@ describe('html', function () {
       },
       {
         type: 'js',
-        assets: [
-          'index.js',
-          'index.js',
-          'index.js',
-          'index.js',
-          'client.js',
-          'bundle-manifest.js',
-          'esm-js-loader.js',
-        ],
+        assets: ['index.js', 'index.js', 'index.js', 'index.js', 'client.js'],
       },
       {
         type: 'js',
@@ -2455,7 +2454,6 @@ describe('html', function () {
         type: 'js',
         assets: [
           'a.js',
-          'bundle-url.js',
           'esmodule-helpers.js',
           'get-worker-url.js',
           'index.js',
@@ -2689,7 +2687,7 @@ describe('html', function () {
     await getNextBuild(b);
 
     let html = await outputFS.readFile('/dist/index.html', 'utf8');
-    assert(html.includes(`console.log("test")`));
+    assert(html.includes(`console.log('test')`));
 
     await overlayFS.writeFile(
       path.join(__dirname, '/html-inline-js-require/test.js'),
@@ -2698,7 +2696,7 @@ describe('html', function () {
     await getNextBuild(b);
 
     html = await outputFS.readFile(path.join(distDir, '/index.html'), 'utf8');
-    assert(html.includes(`console.log("foo")`));
+    assert(html.includes(`console.log('foo')`));
   });
 
   it('should invalidate parent bundle when nested inline bundles change', async function () {
@@ -2927,7 +2925,11 @@ describe('html', function () {
 
     let output = await outputFS.readFile(b.getBundles()[0].filePath, 'utf8');
     assert(output.includes('<x-custom stddeviation="0.5"'));
-    assert(output.includes('<svg role="img" viewBox='));
+    assert(
+      output.includes(
+        '<svg preserveAspectRatio="xMinYMin meet" role="img" viewBox=',
+      ),
+    );
     assert(output.includes('<filter'));
     assert(output.includes('<feGaussianBlur in="SourceGraphic" stdDeviation='));
   });
@@ -3054,5 +3056,185 @@ describe('html', function () {
     );
 
     await run(b, {output: null}, {require: false});
+  });
+
+  it('should insert bundle manifest into the correct bundle with multiple script tags', async function () {
+    const dir = path.join(__dirname, 'manifest-multi-script');
+    overlayFS.mkdirp(dir);
+
+    await fsFixture(overlayFS, dir)`
+        index.html:
+          <body>
+            <script src="./polyfills.js" type="module"></script>
+            <script src="./main.js" type="module"></script>
+          </body>
+
+        polyfills.js:
+          import('./polyfills-async');
+        polyfills-async.js:
+          export const foo = 2;
+        main.js:
+          import('./main-async');
+        main-async.js:
+          export const bar = 3;
+        `;
+
+    let b = await bundle(path.join(dir, '/index.html'), {
+      inputFS: overlayFS,
+    });
+
+    // Should not error with "Cannot find module" error at runtime.
+    await run(b);
+  });
+
+  describe('import maps', function () {
+    let dir;
+    let count = 0;
+    beforeEach(async () => {
+      dir = path.join(__dirname, 'html-import-maps-' + ++count);
+      await overlayFS.mkdirp(dir);
+    });
+
+    it('should generate an import map', async function () {
+      await fsFixture(overlayFS, dir)`
+        index.html:
+          <body>
+            <script src="./main.js" type="module"></script>
+          </body>
+        main.js:
+          globalThis.output = async () => (await import('./main-async')).bar();
+        main-async.js:
+          import './main-async.css';
+          export const bar = async () => (await import('./nested-async')).bar + 3;
+        main-async.css:
+          .foo { color: red }
+        nested-async.js:
+          import './nested-async.css';
+          export const bar = 4;
+        nested-async.css:
+          .bar { color: green }
+        `;
+
+      let b = await bundle(path.join(dir, '/index.html'), {
+        inputFS: overlayFS,
+        mode: 'production',
+      });
+
+      let html = await overlayFS.readFile(b.getBundles()[0].filePath, 'utf8');
+      let importMap = JSON.parse(
+        html.match(/<script type="importmap">(.*?)<\/script>/)[1],
+      );
+      assert.deepEqual(importMap, {
+        imports: {
+          [b.getBundles()[2].publicId]:
+            '/' + path.basename(b.getBundles()[2].filePath),
+          [b.getBundles()[3].publicId]:
+            '/' + path.basename(b.getBundles()[3].filePath),
+          [b.getBundles()[4].publicId]:
+            '/' + path.basename(b.getBundles()[4].filePath),
+          [b.getBundles()[5].publicId]:
+            '/' + path.basename(b.getBundles()[5].filePath),
+        },
+      });
+
+      assert(
+        html.indexOf('<script type="importmap">') < html.indexOf('<script src'),
+      );
+
+      let res = await run(b, null, {require: false});
+      let value = await res.output();
+      assert.equal(value, 7);
+    });
+
+    it('should merge with an existing import map', async function () {
+      await fsFixture(overlayFS, dir)`
+        index.html:
+          <body>
+            <script type="importmap">
+              {"imports": {"react": "https://esm.sh/react@18.2.0"}}
+            </script>
+            <script type="module" src="./main.js"></script>
+          </body>
+        main.js:
+          globalThis.output = async () => (await import('./main-async')).bar;
+        main-async.js:
+          export const bar = 3;
+        `;
+
+      let b = await bundle(path.join(dir, '/index.html'), {
+        inputFS: overlayFS,
+        mode: 'production',
+      });
+
+      let html = await overlayFS.readFile(b.getBundles()[0].filePath, 'utf8');
+      let importMap = JSON.parse(
+        html.match(/<script type="importmap">(.*?)<\/script>/)[1],
+      );
+      assert.deepEqual(importMap, {
+        imports: {
+          react: 'https://esm.sh/react@18.2.0',
+          [b.getBundles()[2].publicId]:
+            '/' + path.basename(b.getBundles()[2].filePath),
+        },
+      });
+
+      assert(
+        html.indexOf('<script type="importmap">') <
+          html.indexOf('<script type="module"'),
+      );
+
+      let res = await run(b, null, {require: false});
+      let value = await res.output();
+      assert.equal(value, 3);
+    });
+
+    it('should merge with an existing import map with shared bundles', async function () {
+      await fsFixture(overlayFS, dir)`
+        index.html:
+          <html>
+            <body>
+              <script type="importmap">
+                {"imports": {"react": "https://esm.sh/react@18.2.0"}}
+              </script>
+              <script type="module" src="./main.js"></script>
+            </body>
+          </html>
+        main.js:
+          import 'lodash';
+          globalThis.output = async () => (await import('./main-async')).bar;
+        main-async.js:
+          export const bar = 3;
+        other.html:
+          <script type="module" src="./other.js"></script>
+        other.js:
+          import 'lodash';
+        `;
+
+      let b = await bundle(path.join(dir, '/*.html'), {
+        inputFS: overlayFS,
+        mode: 'production',
+      });
+
+      let html = await overlayFS.readFile(b.getBundles()[0].filePath, 'utf8');
+      let importMap = JSON.parse(
+        html.match(/<script type="importmap">(.*?)<\/script>/)[1],
+      );
+      assert.deepEqual(importMap, {
+        imports: {
+          react: 'https://esm.sh/react@18.2.0',
+          [b.getBundles()[2].publicId]:
+            '/' + path.basename(b.getBundles()[2].filePath),
+        },
+      });
+
+      assert(
+        html.indexOf('<script type="importmap">') <
+          html.indexOf('<script type="module"'),
+      );
+
+      let res = await run(b, null, {require: false});
+      let value = await res.output();
+      assert.equal(value, 3);
+    });
   });
 });

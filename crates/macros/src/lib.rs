@@ -1,14 +1,22 @@
-use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+#![deny(unused_crate_dependencies)]
 
-use swc_core::common::util::take::Take;
-use swc_core::common::{SourceMap, Span, DUMMY_SP};
-use swc_core::ecma::ast::*;
-use swc_core::ecma::atoms::{js_word, JsWord};
-use swc_core::ecma::parser::lexer::Lexer;
-use swc_core::ecma::parser::{error::Error, Parser, StringInput};
-use swc_core::ecma::visit::{Fold, FoldWith};
+use serde::{Deserialize, Serialize};
+use std::{
+  collections::{HashMap, HashSet},
+  sync::Arc,
+};
+use swc_core::ecma::utils::stack_size::maybe_grow_default;
+
+use indexmap::IndexMap;
+use swc_core::{
+  common::{sync::Lrc, util::take::Take, SourceMap, Span, DUMMY_SP},
+  ecma::{
+    ast::*,
+    atoms::{js_word, JsWord},
+    parser::{error::Error, lexer::Lexer, Parser, StringInput},
+    visit::{Fold, FoldWith},
+  },
+};
 
 #[cfg(feature = "napi")]
 pub mod napi;
@@ -37,9 +45,8 @@ pub type MacroCallback =
 pub struct Macros<'a> {
   /// Mapping of imported identifiers to import metadata.
   macros: HashMap<Id, MacroImport>,
-  constants: HashMap<Id, Result<JsValue, Span>>,
+  evaluator: Evaluator<'a>,
   callback: MacroCallback,
-  source_map: &'a SourceMap,
   errors: &'a mut Vec<MacroError>,
   load_errors: HashSet<String>,
   assignment_span: Option<Span>,
@@ -63,10 +70,9 @@ impl<'a> Macros<'a> {
   ) -> Self {
     Macros {
       macros: HashMap::new(),
-      constants: HashMap::new(),
+      evaluator: Evaluator::new(source_map),
       load_errors: HashSet::new(),
       callback,
-      source_map,
       errors,
       assignment_span: None,
       in_call: false,
@@ -130,7 +136,7 @@ impl<'a> Macros<'a> {
     // Try to statically evaluate all of the function arguments.
     let mut args = Vec::with_capacity(call.args.len());
     for arg in &call.args {
-      match self.eval(&*arg.expr) {
+      match self.evaluator.eval(&*arg.expr) {
         Ok(val) => {
           if arg.spread.is_none() {
             args.push(val);
@@ -147,13 +153,13 @@ impl<'a> Macros<'a> {
     }
 
     // If that was successful, call the function callback (on the JS thread).
-    let loc = self.source_map.lookup_char_pos(call.span.lo);
+    let loc = self.evaluator.source_map.lookup_char_pos(call.span.lo);
     let loc = Location {
       line: loc.line as u32,
       col: loc.col_display as u32,
     };
     match (self.callback)(src.clone(), export, args, loc) {
-      Ok(val) => Ok(self.value_to_expr(val)?),
+      Ok(val) => Ok(self.evaluator.value_to_expr(val)?),
       Err(err) => match err {
         MacroError::LoadError(err, _) => {
           self.load_errors.insert(src);
@@ -217,7 +223,7 @@ impl<'a> Fold for Macros<'a> {
                 let imported = match &member.prop {
                   MemberProp::Ident(id) => id.sym.to_string(),
                   MemberProp::Computed(s) => {
-                    if let Ok(JsValue::String(s)) = self.eval(&s.expr) {
+                    if let Ok(JsValue::String(s)) = self.evaluator.eval(&s.expr) {
                       s
                     } else {
                       break 'block;
@@ -247,7 +253,7 @@ impl<'a> Fold for Macros<'a> {
       return Expr::Call(call);
     }
 
-    node.fold_children_with(self)
+    maybe_grow_default(|| node.fold_children_with(self))
   }
 
   fn fold_var_decl(&mut self, mut node: VarDecl) -> VarDecl {
@@ -256,8 +262,8 @@ impl<'a> Fold for Macros<'a> {
     if node.kind == VarDeclKind::Const {
       for decl in &node.decls {
         if let Some(expr) = &decl.init {
-          let val = self.eval(&*expr);
-          self.eval_pat(val, &decl.name);
+          let val = self.evaluator.eval(&*expr);
+          self.evaluator.eval_pat(val, &decl.name);
         }
       }
     }
@@ -279,7 +285,7 @@ impl<'a> Fold for Macros<'a> {
       // Error when re-assigning a property of a constant that's used in a macro.
       let node = node.fold_children_with(self);
       if let Expr::Ident(id) = &*node.obj {
-        if let Some(constant) = self.constants.get_mut(&id.to_id()) {
+        if let Some(constant) = self.evaluator.constants.get_mut(&id.to_id()) {
           if constant.is_ok() {
             *constant = Err(assignment_span.clone());
           }
@@ -292,8 +298,9 @@ impl<'a> Fold for Macros<'a> {
       // If the member expression evaluates to an object, continue traversing so we error in fold_ident.
       // Otherwise, return early to allow other properties to be accessed without error.
       let value = self
+        .evaluator
         .eval(&*node.obj)
-        .and_then(|obj| self.eval_member_prop(obj, &node));
+        .and_then(|obj| self.evaluator.eval_member_prop(obj, &node));
       if !matches!(
         value,
         Err(..) | Ok(JsValue::Object(..) | JsValue::Array(..))
@@ -307,7 +314,7 @@ impl<'a> Fold for Macros<'a> {
 
   fn fold_ident(&mut self, node: Ident) -> Ident {
     if self.in_call {
-      if let Some(constant) = self.constants.get_mut(&node.to_id()) {
+      if let Some(constant) = self.evaluator.constants.get_mut(&node.to_id()) {
         if matches!(constant, Ok(JsValue::Object(..) | JsValue::Array(..))) {
           // Mark access to constant object inside a call as an error since it could potentially be mutated.
           *constant = Err(node.span.clone());
@@ -325,7 +332,9 @@ fn is_macro(with: &ObjectLit) -> bool {
     if let PropOrSpread::Prop(prop) = &prop {
       if let Prop::KeyValue(kv) = &**prop {
         let k = match &kv.key {
-          PropName::Ident(Ident { sym, .. }) | PropName::Str(Str { value: sym, .. }) => sym.clone(),
+          PropName::Ident(IdentName { sym, .. }) | PropName::Str(Str { value: sym, .. }) => {
+            sym.clone()
+          }
           _ => continue,
         };
         if &k == "type"
@@ -353,7 +362,8 @@ fn handle_error(result: Result<Expr, MacroError>, errors: &mut Vec<MacroError>) 
 }
 
 /// A type that represents a basic JS value.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum JsValue {
   Undefined,
   Null,
@@ -366,9 +376,21 @@ pub enum JsValue {
   Function(String),
 }
 
-impl<'a> Macros<'a> {
+pub struct Evaluator<'a> {
+  pub constants: HashMap<Id, Result<JsValue, Span>>,
+  source_map: &'a SourceMap,
+}
+
+impl<'a> Evaluator<'a> {
+  pub fn new(source_map: &'a SourceMap) -> Evaluator<'_> {
+    Evaluator {
+      constants: HashMap::new(),
+      source_map,
+    }
+  }
+
   /// Statically evaluate a JS expression to a value, if possible.
-  fn eval(&self, expr: &Expr) -> Result<JsValue, Span> {
+  pub fn eval(&self, expr: &Expr) -> Result<JsValue, Span> {
     match expr.unwrap_parens() {
       Expr::Lit(lit) => match lit {
         Lit::Null(_) => Ok(JsValue::Null),
@@ -428,50 +450,7 @@ impl<'a> Macros<'a> {
         }
         Ok(JsValue::Array(res))
       }
-      Expr::Object(obj) => {
-        let mut res = IndexMap::with_capacity(obj.props.len());
-        for prop in &obj.props {
-          match prop {
-            PropOrSpread::Prop(prop) => match &**prop {
-              Prop::KeyValue(kv) => {
-                let v = self.eval(&*kv.value)?;
-                let k = match &kv.key {
-                  PropName::Ident(Ident { sym, .. }) | PropName::Str(Str { value: sym, .. }) => {
-                    sym.to_string()
-                  }
-                  PropName::Num(n) => n.value.to_string(),
-                  PropName::Computed(c) => match self.eval(&*c.expr) {
-                    Err(e) => return Err(e),
-                    Ok(JsValue::String(s)) => s,
-                    Ok(JsValue::Number(n)) => n.to_string(),
-                    Ok(JsValue::Bool(b)) => b.to_string(),
-                    _ => return Err(c.span),
-                  },
-                  PropName::BigInt(v) => return Err(v.span),
-                };
-
-                res.insert(k.to_string(), v);
-              }
-              Prop::Shorthand(s) => {
-                if let Some(val) = self.constants.get(&s.to_id()) {
-                  res.insert(s.sym.to_string(), val.clone()?);
-                } else {
-                  return Err(s.span);
-                }
-              }
-              _ => return Err(obj.span),
-            },
-            PropOrSpread::Spread(spread) => {
-              let v = self.eval(&*spread.expr)?;
-              match v {
-                JsValue::Object(o) => res.extend(o),
-                _ => return Err(obj.span),
-              }
-            }
-          }
-        }
-        Ok(JsValue::Object(res))
-      }
+      Expr::Object(obj) => self.eval_object(obj),
       Expr::Bin(bin) => match (bin.op, self.eval(&*bin.left), self.eval(&*bin.right)) {
         (BinaryOp::Add, Ok(JsValue::String(a)), Ok(JsValue::String(b))) => {
           Ok(JsValue::String(format!("{}{}", a, b)))
@@ -641,6 +620,12 @@ impl<'a> Macros<'a> {
           Err(opt.span)
         }
       }
+      Expr::TsAs(TsAsExpr { expr, .. })
+      | Expr::TsNonNull(TsNonNullExpr { expr, .. })
+      | Expr::TsSatisfies(TsSatisfiesExpr { expr, .. })
+      | Expr::TsTypeAssertion(TsTypeAssertion { expr, .. })
+      | Expr::TsInstantiation(TsInstantiation { expr, .. })
+      | Expr::TsConstAssertion(TsConstAssertion { expr, .. }) => self.eval(expr),
       Expr::Fn(FnExpr { function, .. }) => Err(function.span),
       Expr::Class(ClassExpr { class, .. }) => Err(class.span),
       Expr::JSXElement(el) => Err(el.span),
@@ -655,12 +640,59 @@ impl<'a> Macros<'a> {
       | Expr::Yield(YieldExpr { span, .. })
       | Expr::Await(AwaitExpr { span, .. })
       | Expr::JSXFragment(JSXFragment { span, .. })
-      | Expr::PrivateName(PrivateName { span, .. }) => Err(*span),
+      | Expr::PrivateName(PrivateName { span, .. })
+      | Expr::SuperProp(SuperPropExpr { span, .. })
+      | Expr::MetaProp(MetaPropExpr { span, .. }) => Err(*span),
       _ => Err(DUMMY_SP),
     }
   }
 
-  fn eval_member_prop(&self, obj: JsValue, member: &MemberExpr) -> Result<JsValue, Span> {
+  pub fn eval_object(&self, obj: &ObjectLit) -> Result<JsValue, Span> {
+    let mut res = IndexMap::with_capacity(obj.props.len());
+    for prop in &obj.props {
+      match prop {
+        PropOrSpread::Prop(prop) => match &**prop {
+          Prop::KeyValue(kv) => {
+            let v = self.eval(&*kv.value)?;
+            let k = match &kv.key {
+              PropName::Ident(IdentName { sym, .. }) | PropName::Str(Str { value: sym, .. }) => {
+                sym.to_string()
+              }
+              PropName::Num(n) => n.value.to_string(),
+              PropName::Computed(c) => match self.eval(&*c.expr) {
+                Err(e) => return Err(e),
+                Ok(JsValue::String(s)) => s,
+                Ok(JsValue::Number(n)) => n.to_string(),
+                Ok(JsValue::Bool(b)) => b.to_string(),
+                _ => return Err(c.span),
+              },
+              PropName::BigInt(v) => return Err(v.span),
+            };
+
+            res.insert(k.to_string(), v);
+          }
+          Prop::Shorthand(s) => {
+            if let Some(val) = self.constants.get(&s.to_id()) {
+              res.insert(s.sym.to_string(), val.clone()?);
+            } else {
+              return Err(s.span);
+            }
+          }
+          _ => return Err(obj.span),
+        },
+        PropOrSpread::Spread(spread) => {
+          let v = self.eval(&*spread.expr)?;
+          match v {
+            JsValue::Object(o) => res.extend(o),
+            _ => return Err(obj.span),
+          }
+        }
+      }
+    }
+    Ok(JsValue::Object(res))
+  }
+
+  pub fn eval_member_prop(&self, obj: JsValue, member: &MemberExpr) -> Result<JsValue, Span> {
     match &member.prop {
       MemberProp::Ident(id) => obj.get_id(id.as_ref()).ok_or(member.span),
       MemberProp::Computed(prop) => {
@@ -672,10 +704,10 @@ impl<'a> Macros<'a> {
   }
 
   /// Convert JS value to AST.
-  fn value_to_expr(&self, value: JsValue) -> Result<Expr, MacroError> {
+  pub fn value_to_expr(&self, value: JsValue) -> Result<Expr, MacroError> {
     Ok(match value {
       JsValue::Null => Expr::Lit(Lit::Null(Null::dummy())),
-      JsValue::Undefined => Expr::Ident(Ident::new(js_word!("undefined"), DUMMY_SP)),
+      JsValue::Undefined => Expr::Ident(Ident::new_no_ctxt(js_word!("undefined"), DUMMY_SP)),
       JsValue::Bool(b) => Expr::Lit(Lit::Bool(Bool {
         value: b,
         span: DUMMY_SP,
@@ -714,7 +746,7 @@ impl<'a> Macros<'a> {
           .map(|(k, v)| -> Result<_, MacroError> {
             Ok(PropOrSpread::Prop(Box::new(Prop::KeyValue(KeyValueProp {
               key: if Ident::verify_symbol(&k).is_ok() {
-                PropName::Ident(Ident::new(k.into(), DUMMY_SP))
+                PropName::Ident(IdentName::new(k.into(), DUMMY_SP))
               } else {
                 PropName::Str(Str {
                   value: k.into(),
@@ -728,9 +760,10 @@ impl<'a> Macros<'a> {
           .collect::<Result<Vec<_>, MacroError>>()?,
       }),
       JsValue::Function(source) => {
-        let source_file = self
-          .source_map
-          .new_source_file(swc_core::common::FileName::MacroExpansion, source.into());
+        let source_file = self.source_map.new_source_file(
+          Lrc::new(swc_core::common::FileName::MacroExpansion),
+          source.into(),
+        );
         let lexer = Lexer::new(
           Default::default(),
           Default::default(),
@@ -747,7 +780,7 @@ impl<'a> Macros<'a> {
     })
   }
 
-  fn eval_pat(&mut self, value: Result<JsValue, Span>, pat: &Pat) {
+  pub fn eval_pat(&mut self, value: Result<JsValue, Span>, pat: &Pat) {
     match pat {
       Pat::Ident(name) => {
         self.constants.insert(name.to_id(), value);

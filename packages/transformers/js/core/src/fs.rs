@@ -1,13 +1,22 @@
-use crate::collect::{Collect, Import};
-use crate::dependency_collector::{DependencyDescriptor, DependencyKind};
-use crate::id;
-use crate::utils::SourceLocation;
-use data_encoding::{BASE64, HEXLOWER};
 use std::path::{Path, PathBuf};
-use swc_core::common::{Mark, Span, DUMMY_SP};
-use swc_core::ecma::ast::*;
-use swc_core::ecma::atoms::JsWord;
-use swc_core::ecma::visit::{Fold, FoldWith, VisitWith};
+
+use data_encoding::{BASE64, HEXLOWER};
+use swc_core::{
+  common::{Mark, Span, SyntaxContext, DUMMY_SP},
+  ecma::{
+    ast::*,
+    atoms::JsWord,
+    utils::stack_size::maybe_grow_default,
+    visit::{Fold, FoldWith, VisitWith},
+  },
+};
+
+use crate::{
+  collect::{Collect, Import},
+  dependency_collector::{DependencyDescriptor, DependencyFlags, DependencyKind},
+  id,
+  utils::SourceLocation,
+};
 
 pub fn inline_fs<'a>(
   filename: &str,
@@ -61,7 +70,7 @@ impl<'a> Fold for InlineFS<'a> {
       }
     }
 
-    node.fold_children_with(self)
+    maybe_grow_default(|| node.fold_children_with(self))
   }
 }
 
@@ -173,8 +182,7 @@ impl<'a> InlineFS<'a> {
           loc: SourceLocation::from(&self.collect.source_map, span),
           specifier: path.to_str().unwrap().into(),
           attributes: None,
-          is_optional: false,
-          is_helper: false,
+          flags: DependencyFlags::empty(),
           source_type: None,
           placeholder: None,
         });
@@ -185,9 +193,10 @@ impl<'a> InlineFS<'a> {
             callee: Callee::Expr(Box::new(Expr::Member(MemberExpr {
               obj: Box::new(Expr::Ident(Ident::new(
                 "Buffer".into(),
-                DUMMY_SP.apply_mark(self.collect.unresolved_mark),
+                DUMMY_SP,
+                SyntaxContext::empty().apply_mark(self.collect.unresolved_mark),
               ))),
-              prop: MemberProp::Ident(Ident::new("from".into(), DUMMY_SP)),
+              prop: MemberProp::Ident(IdentName::new("from".into(), DUMMY_SP)),
               span: DUMMY_SP,
             }))),
             args: vec![
@@ -201,6 +210,7 @@ impl<'a> InlineFS<'a> {
               },
             ],
             span: DUMMY_SP,
+            ctxt: SyntaxContext::empty(),
             type_args: None,
           }))
         } else {
@@ -218,7 +228,7 @@ struct Evaluator<'a> {
 
 impl<'a> Fold for Evaluator<'a> {
   fn fold_expr(&mut self, node: Expr) -> Expr {
-    let node = node.fold_children_with(self);
+    let node = maybe_grow_default(|| node.fold_children_with(self));
 
     match &node {
       Expr::Ident(ident) => match ident.sym.to_string().as_str() {

@@ -120,6 +120,12 @@ export default class BundleGraph<TBundle: IBundle>
       .map(bundle => this.#createBundle(bundle, this.#graph, this.#options));
   }
 
+  getReferencingBundles(bundle: IBundle): Array<TBundle> {
+    return this.#graph
+      .getReferencingBundles(bundleToInternalBundle(bundle))
+      .map(bundle => this.#createBundle(bundle, this.#graph, this.#options));
+  }
+
   resolveAsyncDependency(
     dependency: IDependency,
     bundle: ?IBundle,
@@ -325,5 +331,11 @@ export default class BundleGraph<TBundle: IBundle>
       this.#options.projectRoot,
       targetToInternalTarget(target),
     );
+  }
+
+  getEntryBundles(): Array<TBundle> {
+    return this.#graph
+      .getEntryBundles()
+      .map(b => this.#createBundle(b, this.#graph, this.#options));
   }
 }

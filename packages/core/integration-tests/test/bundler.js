@@ -2,8 +2,8 @@ import path from 'path';
 import assert from 'assert';
 import Logger from '@parcel/logger';
 import {
-  bundle,
   assertBundles,
+  bundle,
   findAsset,
   overlayFS,
   fsFixture,
@@ -66,11 +66,9 @@ describe('bundler', function () {
         name: 'index.js',
         assets: [
           'index.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'esmodule-helpers.js',
           'js-loader.js',
-          'bundle-manifest.js',
         ],
       },
       {
@@ -117,7 +115,9 @@ describe('bundler', function () {
 
     let messages = [];
     let loggerDisposable = Logger.onLog(message => {
-      messages.push(message);
+      if (message.level !== 'verbose') {
+        messages.push(message);
+      }
     });
     let b = await bundle(
       path.join(__dirname, 'disable-shared-bundles-true-parallel/index.js'),
@@ -149,11 +149,9 @@ describe('bundler', function () {
         name: 'index.js',
         assets: [
           'index.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'esmodule-helpers.js',
           'js-loader.js',
-          'bundle-manifest.js',
         ],
       },
       {
@@ -200,7 +198,9 @@ describe('bundler', function () {
 
     let messages = [];
     let loggerDisposable = Logger.onLog(message => {
-      messages.push(message);
+      if (message.level !== 'verbose') {
+        messages.push(message);
+      }
     });
     let b = await bundle(
       path.join(
@@ -235,11 +235,9 @@ describe('bundler', function () {
         name: 'index.js',
         assets: [
           'index.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'esmodule-helpers.js',
           'js-loader.js',
-          'bundle-manifest.js',
         ],
       },
       {
@@ -286,7 +284,9 @@ describe('bundler', function () {
 
     let messages = [];
     let loggerDisposable = Logger.onLog(message => {
-      messages.push(message);
+      if (message.level !== 'verbose') {
+        messages.push(message);
+      }
     });
     let b = await bundle(
       path.join(__dirname, 'disable-shared-bundles-true-min-bundles/index.js'),
@@ -318,11 +318,9 @@ describe('bundler', function () {
         name: 'index.js',
         assets: [
           'index.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'esmodule-helpers.js',
           'js-loader.js',
-          'bundle-manifest.js',
         ],
       },
       {
@@ -371,7 +369,9 @@ describe('bundler', function () {
 
     let messages = [];
     let loggerDisposable = Logger.onLog(message => {
-      messages.push(message);
+      if (message.level !== 'verbose') {
+        messages.push(message);
+      }
     });
     let b = await bundle(
       path.join(
@@ -428,11 +428,9 @@ describe('bundler', function () {
         name: 'index.js',
         assets: [
           'index.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'esmodule-helpers.js',
           'js-loader.js',
-          'bundle-manifest.js',
         ],
       },
       {
@@ -481,7 +479,9 @@ describe('bundler', function () {
 
     let messages = [];
     let loggerDisposable = Logger.onLog(message => {
-      messages.push(message);
+      if (message.level !== 'verbose') {
+        messages.push(message);
+      }
     });
     let b = await bundle(
       path.join(__dirname, 'disable-shared-bundles-false/index.js'),
@@ -501,11 +501,9 @@ describe('bundler', function () {
         name: 'index.js',
         assets: [
           'index.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'esmodule-helpers.js',
           'js-loader.js',
-          'bundle-manifest.js',
         ],
       },
       {
@@ -570,7 +568,6 @@ describe('bundler', function () {
         assets: [
           'inline-module.js',
           'local.html',
-          'bundle-url.js',
           'cacheLoader.js',
           'js-loader.js',
         ],
@@ -597,12 +594,10 @@ describe('bundler', function () {
         name: 'index.js',
         assets: [
           'index.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'css-loader.js',
           'esmodule-helpers.js',
           'js-loader.js',
-          'bundle-manifest.js',
         ],
       },
       {
@@ -647,12 +642,10 @@ describe('bundler', function () {
         name: 'index.js',
         assets: [
           'index.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'css-loader.js',
           'esmodule-helpers.js',
           'js-loader.js',
-          'bundle-manifest.js',
         ],
       },
       {
@@ -696,12 +689,10 @@ describe('bundler', function () {
         name: 'index.js',
         assets: [
           'index.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'css-loader.js',
           'esmodule-helpers.js',
           'js-loader.js',
-          'bundle-manifest.js',
         ],
       },
       {
@@ -748,12 +739,10 @@ describe('bundler', function () {
         name: 'index.js',
         assets: [
           'index.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'css-loader.js',
           'esmodule-helpers.js',
           'js-loader.js',
-          'bundle-manifest.js',
         ],
       },
       {
@@ -799,12 +788,10 @@ describe('bundler', function () {
         name: 'index.js',
         assets: [
           'index.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'css-loader.js',
           'esmodule-helpers.js',
           'js-loader.js',
-          'bundle-manifest.js',
         ],
       },
       {
@@ -832,108 +819,6 @@ describe('bundler', function () {
         .getReferencedBundles(b.getBundlesWithAsset(findAsset(b, 'bar.js'))[0])
         .includes(b.getBundlesWithAsset(findAsset(b, 'c.js'))[0]),
     );
-  });
-
-  it('should split manifest bundle', async function () {
-    let b = await bundle(
-      [
-        path.join(__dirname, 'integration/split-manifest-bundle/a.html'),
-        path.join(__dirname, 'integration/split-manifest-bundle/b.html'),
-      ],
-      {
-        mode: 'production',
-        defaultTargetOptions: {
-          shouldScopeHoist: false,
-          shouldOptimize: false,
-        },
-      },
-    );
-
-    // There should be two manifest bundles added, one for a.js, one for b.js
-    assertBundles(b, [
-      {
-        assets: ['a.html'],
-      },
-      {
-        assets: ['b.html'],
-      },
-      {
-        assets: ['a.js', 'cacheLoader.js', 'js-loader.js'],
-      },
-      {
-        assets: ['bundle-manifest.js', 'bundle-url.js'], // manifest bundle
-      },
-      {
-        assets: [
-          'b.js',
-          'cacheLoader.js',
-          'js-loader.js',
-          'esmodule-helpers.js',
-        ],
-      },
-      {
-        assets: ['bundle-manifest.js', 'bundle-url.js'], // manifest bundle
-      },
-      {
-        assets: ['c.js'],
-      },
-    ]);
-
-    let aManifestBundle = b
-      .getBundles()
-      .find(
-        bundle => !bundle.getMainEntry() && bundle.name.includes('runtime'),
-      );
-
-    let bBundles = b
-      .getBundles()
-      .filter(bundle => /b\.HASH_REF/.test(bundle.name));
-
-    let aBundleManifestAsset;
-    aManifestBundle.traverseAssets((asset, _, {stop}) => {
-      if (/runtime-[a-z0-9]{16}\.js/.test(asset.filePath)) {
-        aBundleManifestAsset = asset;
-        stop();
-      }
-    });
-    let aBundleManifestAssetCode = await aBundleManifestAsset.getCode();
-
-    // Assert the a.js manifest bundle is aware of all the b.js bundles
-    for (let bundle of bBundles) {
-      assert(
-        aBundleManifestAssetCode.includes(bundle.name),
-        `Bundle should contain reference to: "${bundle.name}"`,
-      );
-    }
-  });
-
-  it('should not split manifest bundle for stable entries', async function () {
-    let b = await bundle(
-      path.join(__dirname, 'integration/split-manifest-bundle/a.js'),
-      {
-        mode: 'production',
-        defaultTargetOptions: {
-          shouldScopeHoist: false,
-        },
-      },
-    );
-
-    assertBundles(b, [
-      {
-        assets: [
-          'a.js',
-          'b.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'js-loader.js',
-          'esmodule-helpers.js',
-          'bundle-manifest.js',
-        ],
-      },
-      {
-        assets: ['c.js'],
-      },
-    ]);
   });
 
   it('should respect mode specific config', async function () {
@@ -991,11 +876,9 @@ describe('bundler', function () {
         name: 'index.js',
         assets: [
           'index.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'esmodule-helpers.js',
           'js-loader.js',
-          'bundle-manifest.js',
         ],
       },
       {
@@ -1204,6 +1087,48 @@ describe('bundler', function () {
     ]);
   });
 
+  it('should support inline constants in async bundles', async () => {
+    await fsFixture(overlayFS, __dirname)`
+    inline-constants-async
+      index.js:
+        import('./async').then(m => console.log(m.value));
+
+      async.js:
+        export const value = 'async value';
+
+      package.json:
+        {
+          "@parcel/transformer-js": {
+            "unstable_inlineConstants": true
+          }
+        }
+
+      yarn.lock:`;
+
+    let b = await bundle(
+      path.join(__dirname, 'inline-constants-async/index.js'),
+      {
+        mode: 'production',
+        defaultTargetOptions: {
+          shouldScopeHoist: true,
+          sourceMaps: false,
+          shouldOptimize: false,
+        },
+        inputFS: overlayFS,
+      },
+    );
+
+    // This will fail when the async bundle does not export it's constant
+    await run(b);
+
+    // Asset should not be inlined
+    const index = b.getBundles().find(b => b.name.startsWith('index'));
+    const contents = overlayFS.readFileSync(index.filePath, 'utf8');
+    assert(
+      !contents.includes('async value'),
+      'async value should not be inlined',
+    );
+  });
   describe('manual shared bundles', () => {
     const dir = path.join(__dirname, 'manual-bundle');
 
@@ -1275,13 +1200,10 @@ describe('bundler', function () {
         },
         {
           assets: [
-            'bundle-manifest.js',
-            'bundle-url.js',
             'cacheLoader.js',
             'css-loader.js',
             'esmodule-helpers.js',
             'index.js',
-            'js-loader.js',
           ],
         },
         {
@@ -1438,13 +1360,10 @@ describe('bundler', function () {
         },
         {
           assets: [
-            'bundle-manifest.js',
-            'bundle-url.js',
             'cacheLoader.js',
             'css-loader.js',
             'esmodule-helpers.js',
             'index.js',
-            'js-loader.js',
           ],
         },
         {
@@ -1586,12 +1505,7 @@ describe('bundler', function () {
           assets: ['index.html'],
         },
         {
-          assets: [
-            'bundle-manifest.js',
-            'esm-js-loader.js',
-            'index.js',
-            'vendor-constants.js',
-          ],
+          assets: ['index.js', 'vendor-constants.js'],
         },
         {
           assets: ['async.js'],
@@ -1746,17 +1660,75 @@ describe('bundler', function () {
           assets: ['index.html'],
         },
         {
-          assets: ['a.js', 'i.js'],
+          assets: ['a.js', 'b.js', 'c.js', 'h.js', 'j.js'],
         },
         {
-          assets: ['vendor.js', 'b.js', 'j.js'],
+          assets: ['vendor.js', 'd.js', 'i.js'],
         },
         {
-          assets: ['c.js', 'd.js', 'e.js', 'f.js', 'g.js', 'h.js'],
+          assets: ['e.js', 'f.js', 'g.js'],
         },
         {
           assets: ['esmodule-helpers.js', 'index.js'],
         },
+      ]);
+    });
+
+    it('should support globs matching outside of the project root', async function () {
+      const rootDir = path.join(dir, 'root');
+      overlayFS.mkdirp(rootDir);
+      await fsFixture(overlayFS, rootDir)`
+      yarn.lock:
+        // Required for config loading
+
+      package.json:
+        {
+          "@parcel/bundler-default": {
+            "minBundleSize": 0,
+            "manualSharedBundles": [{
+              "name": "vendor",
+              "root": "vendor.js",
+              "assets": [
+                "in-project.js",
+                "../outside-project.js"
+              ]
+            }]
+          }
+        }
+
+      index.html:
+        <script type="module" src="./index.js"></script>
+
+      in-project.js:
+        export default 'in-project';
+
+      vendor.js:
+        export * from './in-project';
+        export * from '../outside-project';
+
+      index.js:
+        import * as vendor from './vendor';
+
+        console.log(vendor.inProj);
+        console.log(vendor.outProj);`;
+
+      await fsFixture(overlayFS, dir)`
+      outside-project.js:
+        export default 'outside-project';`;
+
+      let b = await bundle(path.join(rootDir, 'index.html'), {
+        defaultTargetOptions: {
+          shouldScopeHoist: false,
+          shouldOptimize: false,
+          sourceMaps: false,
+        },
+        inputFS: overlayFS,
+      });
+
+      assertBundles(b, [
+        {assets: ['index.html']},
+        {assets: ['in-project.js', 'outside-project.js']},
+        {assets: ['esmodule-helpers.js', 'index.js', 'vendor.js']},
       ]);
     });
   });
@@ -1767,11 +1739,11 @@ describe('bundler', function () {
         index.html:
           <link rel="stylesheet" type="text/css" href="./style.css">
           <script src="./index.js" type="module"></script>
-      
+
         style.css:
           @import "common.css";
           body { color: red }
-        
+
         common.css:
           .common { color: green }
 
@@ -1798,7 +1770,7 @@ describe('bundler', function () {
         assets: ['style.css', 'common.css'],
       },
       {
-        assets: ['index.js', 'bundle-manifest.js', 'esm-js-loader.js'],
+        assets: ['index.js'],
       },
       {
         assets: ['async.js'],

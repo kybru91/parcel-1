@@ -1,32 +1,29 @@
+use std::{mem, ptr, slice};
+
 use mozjpeg_sys::*;
-use napi::bindgen_prelude::*;
-use napi::{Env, Error, JsBuffer, Result};
+use napi::{bindgen_prelude::*, Env, Error, JsBuffer, Result};
 use napi_derive::napi;
-use oxipng::{optimize_from_memory, Headers, Options};
-use std::mem;
-use std::ptr;
-use std::slice;
+use oxipng::optimize_from_memory;
 
 #[napi]
 pub fn optimize_image(kind: String, buf: Buffer, env: Env) -> Result<JsBuffer> {
   let slice = buf.as_ref();
 
   match kind.as_ref() {
-    "png" => {
-      let options = Options {
-        strip: Headers::Safe,
-        ..Default::default()
-      };
-      match optimize_from_memory(slice, &options) {
-        Ok(res) => Ok(env.create_buffer_with_data(res)?.into_raw()),
-        Err(err) => Err(Error::from_reason(format!("{}", err))),
-      }
-    }
+    "png" => match optimize_from_memory(slice, &Default::default()) {
+      Ok(res) => Ok(env.create_buffer_with_data(res)?.into_raw()),
+      Err(err) => Err(Error::from_reason(format!("{}", err))),
+    },
     "jpg" | "jpeg" => unsafe {
       match optimize_jpeg(slice) {
         Ok(res) => Ok(
           env
-            .create_buffer_with_borrowed_data(res.as_ptr(), res.len(), res.as_mut_ptr(), finalize)?
+            .create_buffer_with_borrowed_data(
+              res.as_mut_ptr(),
+              res.len(),
+              res.as_mut_ptr(),
+              finalize,
+            )?
             .into_raw(),
         ),
         Err(err) => {
@@ -110,7 +107,7 @@ unsafe fn create_error_handler() -> jpeg_error_mgr {
   err
 }
 
-extern "C" fn unwind_error_exit(cinfo: &mut jpeg_common_struct) {
+extern "C-unwind" fn unwind_error_exit(cinfo: &mut jpeg_common_struct) {
   let message = unsafe {
     let err = cinfo.err.as_ref().unwrap();
     match err.format_message {
@@ -126,4 +123,4 @@ extern "C" fn unwind_error_exit(cinfo: &mut jpeg_common_struct) {
   std::panic::resume_unwind(Box::new(message))
 }
 
-extern "C" fn silence_message(_cinfo: &mut jpeg_common_struct, _level: c_int) {}
+extern "C-unwind" fn silence_message(_cinfo: &mut jpeg_common_struct, _level: c_int) {}

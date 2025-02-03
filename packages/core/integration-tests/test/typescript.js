@@ -4,11 +4,11 @@ import path from 'path';
 import url from 'url';
 import nullthrows from 'nullthrows';
 import {
-  bundle,
-  run,
   assertBundles,
+  bundle,
   distDir,
   outputFS,
+  run,
 } from '@parcel/test-utils';
 
 const tscConfig = path.join(
@@ -103,7 +103,7 @@ describe('typescript', function () {
       assertBundles(b, [
         {
           name: 'index.js',
-          assets: ['index.ts', 'bundle-url.js', 'esmodule-helpers.js'],
+          assets: ['index.ts', 'esmodule-helpers.js'],
         },
         {
           type: 'txt',

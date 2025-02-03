@@ -2349,8 +2349,6 @@ describe('scope hoisting', function () {
             'entry.js',
             'foo.js',
             'bar.js',
-            'bundle-manifest.js',
-            'bundle-url.js',
             'cacheLoader.js',
             'js-loader.js',
           ],
@@ -4307,7 +4305,7 @@ describe('scope hoisting', function () {
       assertBundles(b, [
         {
           type: 'js',
-          assets: ['a.js', 'b.js', 'bundle-url.js'],
+          assets: ['a.js', 'b.js'],
         },
         {
           type: 'txt',
@@ -5573,8 +5571,6 @@ describe('scope hoisting', function () {
       {
         name: 'same-ancestry-scope-hoisting.js',
         assets: [
-          'bundle-manifest.js',
-          'bundle-url.js',
           'cacheLoader.js',
           'dep.js',
           'js-loader.js',
@@ -5598,13 +5594,7 @@ describe('scope hoisting', function () {
     assertBundles(b, [
       {
         name: 'index.js',
-        assets: [
-          'index.js',
-          'bundle-manifest.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'js-loader.js',
-        ],
+        assets: ['index.js', 'cacheLoader.js', 'js-loader.js'],
       },
       {assets: ['dep.js']},
       {
@@ -5639,13 +5629,7 @@ describe('scope hoisting', function () {
       },
       {
         name: 'get-dep-scope-hoisting.js',
-        assets: [
-          'bundle-manifest.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'get-dep-scope-hoisting.js',
-          'js-loader.js',
-        ],
+        assets: ['cacheLoader.js', 'get-dep-scope-hoisting.js', 'js-loader.js'],
       },
     ]);
 
@@ -5686,13 +5670,7 @@ describe('scope hoisting', function () {
       },
       {
         name: 'scope-hoisting.js',
-        assets: [
-          'bundle-manifest.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'scope-hoisting.js',
-          'js-loader.js',
-        ],
+        assets: ['cacheLoader.js', 'scope-hoisting.js', 'js-loader.js'],
       },
     ]);
 
@@ -5735,12 +5713,7 @@ describe('scope hoisting', function () {
     assertBundles(b, [
       {
         name: 'scope-hoisting.js',
-        assets: [
-          'scope-hoisting.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'js-loader.js',
-        ],
+        assets: ['scope-hoisting.js', 'cacheLoader.js', 'js-loader.js'],
       },
       {assets: ['value.js']},
       {assets: ['async.js']},
@@ -5763,21 +5736,11 @@ describe('scope hoisting', function () {
     assertBundles(b, [
       {
         name: 'scope-hoisting.js',
-        assets: [
-          'scope-hoisting.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'js-loader.js',
-        ],
+        assets: ['scope-hoisting.js', 'cacheLoader.js', 'js-loader.js'],
       },
       {
         name: 'other-entry.js',
-        assets: [
-          'other-entry.js',
-          'bundle-url.js',
-          'cacheLoader.js',
-          'js-loader.js',
-        ],
+        assets: ['other-entry.js', 'cacheLoader.js', 'js-loader.js'],
       },
       {assets: ['a.js', 'value.js']},
       {assets: ['b.js']},
@@ -6043,10 +6006,43 @@ describe('scope hoisting', function () {
   });
 
   it('should add experimental bundle queue runtime for out of order bundle execution', async function () {
+    await fsFixture(overlayFS, __dirname)`
+      bundle-queue-runtime
+        a.html:
+          <script type="module" src="./a.js"></script>
+        a.js:
+          export default 'a';
+
+        b.js:
+          export default 'b';
+
+        c.js:
+          export default 'c';
+
+        index.html:
+          <script type="module" src="./index.js"></script>
+        index.js:
+          import a from './a';
+          import b from './b';
+          import c from './c';
+
+          result([a, b, c]);
+
+        package.json:
+          {
+              "@parcel/bundler-default": {
+                  "minBundleSize": 0
+              },
+              "@parcel/packager-js": {
+                  "unstable_asyncBundleRuntime": true
+              }
+          }
+        yarn.lock:`;
+
     let b = await bundle(
       [
-        path.join(__dirname, 'integration/bundle-queue-runtime/index.html'),
-        path.join(__dirname, 'integration/bundle-queue-runtime/a.html'),
+        path.join(__dirname, 'bundle-queue-runtime/index.html'),
+        path.join(__dirname, 'bundle-queue-runtime/a.html'),
       ],
       {
         mode: 'production',
@@ -6055,6 +6051,7 @@ describe('scope hoisting', function () {
           shouldOptimize: false,
           outputFormat: 'esmodule',
         },
+        inputFS: overlayFS,
       },
     );
 
@@ -6074,9 +6071,35 @@ describe('scope hoisting', function () {
     assert.deepEqual(await result, ['a', 'b', 'c']);
   });
 
-  it('should not add experimental bundle queue runtime to empty bundles', async function () {
+  it('should add experimental bundle queue runtime to manual shared bundles', async function () {
+    await fsFixture(overlayFS, __dirname)`
+      bundle-queue-runtime
+        index.html:
+          <script type="module" src="./index.js"></script>
+        shared.js:
+          export default 'shared';
+        index.js:
+          import shared from './shared';
+          result(['index', shared]);
+
+        package.json:
+          {
+              "@parcel/bundler-default": {
+                  "minBundleSize": 0,
+                  "manualSharedBundles": [{
+                    "name": "shared",
+                    "types": ["js"],
+                    "assets": ["shared.js"]
+                  }]
+              },
+              "@parcel/packager-js": {
+                  "unstable_asyncBundleRuntime": true
+              }
+          }
+        yarn.lock:`;
+
     let b = await bundle(
-      [path.join(__dirname, 'integration/bundle-queue-runtime/empty.js')],
+      [path.join(__dirname, 'bundle-queue-runtime/index.html')],
       {
         mode: 'production',
         defaultTargetOptions: {
@@ -6084,11 +6107,84 @@ describe('scope hoisting', function () {
           shouldOptimize: false,
           outputFormat: 'esmodule',
         },
+        inputFS: overlayFS,
+      },
+    );
+    function hasAsset(bundle, assetName) {
+      let result = false;
+
+      bundle.traverseAssets(asset => {
+        if (asset.filePath.includes(assetName)) {
+          result = true;
+        }
+      });
+
+      return result;
+    }
+    let sharedBundleContents = await outputFS.readFile(
+      nullthrows(
+        b.getBundles().find(b => hasAsset(b, 'shared.js')),
+        'No shared bundle',
+      ).filePath,
+      'utf8',
+    );
+    let entryContents = await outputFS.readFile(
+      nullthrows(
+        b.getBundles().find(b => hasAsset(b, 'index.js')),
+        'No entry bundle',
+      ).filePath,
+      'utf8',
+    );
+
+    assert(
+      sharedBundleContents.includes('$parcel$global.rlb('),
+      'Shared bundle should include register loaded bundle runtime',
+    );
+
+    assert(
+      entryContents.includes('$parcel$global.rwr('),
+      'Entry should include run when ready runtime',
+    );
+
+    let result;
+    await run(b, {
+      result: r => {
+        result = r;
+      },
+    });
+
+    assert.deepEqual(await result, ['index', 'shared']);
+  });
+
+  it('should not add experimental bundle queue runtime to empty bundles', async function () {
+    await fsFixture(overlayFS, __dirname)`
+      bundle-queue-runtime
+        empty.js:
+          // Just a comment
+        package.json:
+          {
+             "@parcel/packager-js": {
+                  "unstable_asyncBundleRuntime": true
+              }
+          }
+        yarn.lock:`;
+
+    let b = await bundle(
+      [path.join(__dirname, 'bundle-queue-runtime/empty.js')],
+      {
+        mode: 'production',
+        defaultTargetOptions: {
+          shouldScopeHoist: true,
+          shouldOptimize: false,
+          outputFormat: 'esmodule',
+        },
+        inputFS: overlayFS,
       },
     );
 
     let contents = await outputFS.readFile(
-      b.getBundles().find(b => /empty.*\.js/.test(b.filePath)).filePath,
+      nullthrows(b.getBundles().find(b => /empty.*\.js/.test(b.filePath)))
+        .filePath,
       'utf8',
     );
 

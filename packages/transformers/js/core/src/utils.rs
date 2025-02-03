@@ -1,12 +1,19 @@
-use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use swc_core::common::errors::{DiagnosticBuilder, Emitter};
-use swc_core::common::{Mark, SourceMap, Span, SyntaxContext, DUMMY_SP};
-use swc_core::ecma::ast::{self, Ident};
-use swc_core::ecma::atoms::{js_word, JsWord};
+
+use serde::{Deserialize, Serialize};
+use swc_core::{
+  common::{
+    errors::{DiagnosticBuilder, Emitter},
+    Mark, SourceMap, Span, SyntaxContext, DUMMY_SP,
+  },
+  ecma::{
+    ast::{self, Ident, IdentName},
+    atoms::{js_word, JsWord},
+  },
+};
 
 pub fn is_unresolved(ident: &Ident, unresolved_mark: Mark) -> bool {
-  ident.span.ctxt.outer() == unresolved_mark
+  ident.ctxt.outer() == unresolved_mark
 }
 
 pub fn match_member_expr(expr: &ast::MemberExpr, idents: Vec<&str>, unresolved_mark: Mark) -> bool {
@@ -24,7 +31,7 @@ pub fn match_member_expr(expr: &ast::MemberExpr, idents: Vec<&str>, unresolved_m
           return false;
         }
       }
-      MemberProp::Ident(Ident { ref sym, .. }) => sym,
+      MemberProp::Ident(IdentName { ref sym, .. }) => sym,
       _ => return false,
     };
 
@@ -58,20 +65,20 @@ pub fn create_require(
   ast::CallExpr {
     callee: ast::Callee::Expr(Box::new(ast::Expr::Ident(ast::Ident::new(
       "require".into(),
-      DUMMY_SP.apply_mark(unresolved_mark),
+      DUMMY_SP,
+      SyntaxContext::empty().apply_mark(unresolved_mark),
     )))),
     args: vec![ast::ExprOrSpread {
       expr: Box::new(ast::Expr::Lit(ast::Lit::Str(normalized_specifier.into()))),
       spread: None,
     }],
     span: DUMMY_SP,
+    ctxt: SyntaxContext::empty(),
     type_args: None,
   }
 }
 
-fn is_marked(span: Span, mark: Mark) -> bool {
-  let mut ctxt = span.ctxt();
-
+fn is_marked(mut ctxt: SyntaxContext, mark: Mark) -> bool {
   loop {
     let m = ctxt.remove_mark();
     if m == Mark::root() {
@@ -130,7 +137,7 @@ pub fn match_require(node: &ast::Expr, unresolved_mark: Mark, ignore_mark: Mark)
         Expr::Ident(ident) => {
           if ident.sym == js_word!("require")
             && is_unresolved(&ident, unresolved_mark)
-            && !is_marked(ident.span, ignore_mark)
+            && !is_marked(ident.ctxt, ignore_mark)
           {
             if let Some(arg) = call.args.first() {
               return match_str(&arg.expr).map(|(name, _)| name);
@@ -156,12 +163,12 @@ pub fn match_require(node: &ast::Expr, unresolved_mark: Mark, ignore_mark: Mark)
   }
 }
 
-pub fn match_import(node: &ast::Expr, ignore_mark: Mark) -> Option<JsWord> {
+pub fn match_import(node: &ast::Expr) -> Option<JsWord> {
   use ast::*;
 
   match node {
     Expr::Call(call) => match &call.callee {
-      Callee::Import(ident) if !is_marked(ident.span, ignore_mark) => {
+      Callee::Import(_) => {
         if let Some(arg) = call.args.first() {
           return match_str(&arg.expr).map(|(name, _)| name);
         }
@@ -181,26 +188,33 @@ pub fn create_global_decl_stmt(
 ) -> (ast::Stmt, SyntaxContext) {
   // The correct value would actually be `DUMMY_SP.apply_mark(Mark::fresh(Mark::root()))`.
   // But this saves us from running the resolver again in some cases.
-  let span = DUMMY_SP.apply_mark(global_mark);
+  let ctxt = SyntaxContext::empty().apply_mark(global_mark);
 
   (
     ast::Stmt::Decl(ast::Decl::Var(Box::new(ast::VarDecl {
       kind: ast::VarDeclKind::Var,
       declare: false,
       span: DUMMY_SP,
+      ctxt,
       decls: vec![ast::VarDeclarator {
-        name: ast::Pat::Ident(ast::BindingIdent::from(ast::Ident::new(name, span))),
+        name: ast::Pat::Ident(ast::BindingIdent::from(ast::Ident::new(
+          name, DUMMY_SP, ctxt,
+        ))),
         span: DUMMY_SP,
         definite: false,
         init: Some(Box::new(init)),
       }],
     }))),
-    span.ctxt,
+    ctxt,
   )
 }
 
 pub fn get_undefined_ident(unresolved_mark: Mark) -> ast::Ident {
-  ast::Ident::new(js_word!("undefined"), DUMMY_SP.apply_mark(unresolved_mark))
+  ast::Ident::new(
+    js_word!("undefined"),
+    DUMMY_SP,
+    SyntaxContext::empty().apply_mark(unresolved_mark),
+  )
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -213,7 +227,7 @@ pub struct SourceLocation {
 }
 
 impl SourceLocation {
-  pub fn from(source_map: &swc_core::common::SourceMap, span: swc_core::common::Span) -> Self {
+  pub fn from(source_map: &SourceMap, span: Span) -> Self {
     if span.lo.is_dummy() || span.hi.is_dummy() {
       return SourceLocation {
         start_line: 1,
@@ -275,6 +289,12 @@ pub enum DiagnosticSeverity {
 pub enum SourceType {
   Script,
   Module,
+}
+
+impl Default for SourceType {
+  fn default() -> Self {
+    SourceType::Module
+  }
 }
 
 #[derive(Debug)]
@@ -397,11 +417,13 @@ macro_rules! id {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ErrorBuffer(std::sync::Arc<std::sync::Mutex<Vec<swc_core::common::errors::Diagnostic>>>);
+pub struct ErrorBuffer(
+  std::sync::Arc<parking_lot::Mutex<Vec<swc_core::common::errors::Diagnostic>>>,
+);
 
 impl Emitter for ErrorBuffer {
   fn emit(&mut self, db: &DiagnosticBuilder) {
-    self.0.lock().unwrap().push((**db).clone());
+    self.0.lock().push((**db).clone());
   }
 }
 
@@ -409,7 +431,7 @@ pub fn error_buffer_to_diagnostics(
   error_buffer: &ErrorBuffer,
   source_map: &SourceMap,
 ) -> Vec<Diagnostic> {
-  let s = error_buffer.0.lock().unwrap().clone();
+  let s = error_buffer.0.lock().clone();
   s.iter()
     .map(|diagnostic| {
       let message = diagnostic.message();

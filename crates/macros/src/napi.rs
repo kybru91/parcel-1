@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::{JsValue, Location, MacroCallback, MacroError};
 use crossbeam_channel::{Receiver, Sender};
 use indexmap::IndexMap;
 use napi::{
@@ -9,6 +8,8 @@ use napi::{
 };
 use napi_derive::napi;
 use swc_core::common::DUMMY_SP;
+
+use crate::{JsValue, Location, MacroCallback, MacroError};
 
 struct CallMacroMessage {
   src: String,

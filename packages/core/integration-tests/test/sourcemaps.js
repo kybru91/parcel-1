@@ -448,7 +448,7 @@ describe('sourcemaps', function () {
       source: inputs[0],
       generated: raw,
       str: 'const local',
-      generatedStr: 'let o',
+      generatedStr: 'let r',
       sourcePath: 'index.js',
     });
 
@@ -457,7 +457,7 @@ describe('sourcemaps', function () {
       source: inputs[0],
       generated: raw,
       str: 'local.a',
-      generatedStr: 'o.a',
+      generatedStr: 'r.a',
       sourcePath: 'index.js',
     });
 
@@ -466,7 +466,7 @@ describe('sourcemaps', function () {
       source: inputs[1],
       generated: raw,
       str: 'exports.a',
-      generatedStr: 't.a',
+      generatedStr: 'o.a',
       sourcePath: 'local.js',
     });
 
@@ -475,7 +475,7 @@ describe('sourcemaps', function () {
       source: inputs[2],
       generated: raw,
       str: 'exports.count = function(a, b) {',
-      generatedStr: 't.count=function(e,n){',
+      generatedStr: 'o.count=function(e,n){',
       sourcePath: 'utils/util.js',
     });
   });
@@ -1258,7 +1258,7 @@ describe('sourcemaps', function () {
       source: input,
       generated: raw,
       str: "console.log('foo')",
-      generatedStr: `console.log("foo")`,
+      generatedStr: `console.log('foo')`,
       sourcePath,
     });
 
@@ -1267,7 +1267,7 @@ describe('sourcemaps', function () {
       source: input,
       generated: raw,
       str: "console.log('bar')",
-      generatedStr: `console.log("bar")`,
+      generatedStr: `console.log('bar')`,
       sourcePath,
     });
 
@@ -1276,7 +1276,7 @@ describe('sourcemaps', function () {
       source: input,
       generated: raw,
       str: "console.log('baz')",
-      generatedStr: `console.log("baz")`,
+      generatedStr: `console.log('baz')`,
       sourcePath,
     });
 
@@ -1285,7 +1285,7 @@ describe('sourcemaps', function () {
       source: input,
       generated: raw,
       str: "console.log('idhf')",
-      generatedStr: `console.log("idhf")`,
+      generatedStr: `console.log('idhf')`,
       sourcePath,
     });
   });
@@ -1425,7 +1425,7 @@ describe('sourcemaps', function () {
       source: sourceContent,
       generated: raw,
       str: `foo = 'Lorem ipsum`,
-      generatedStr: `foo = "Lorem ipsum`,
+      generatedStr: `foo = 'Lorem ipsum`,
       sourcePath,
     });
   });

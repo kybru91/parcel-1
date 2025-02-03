@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 
-use swc_core::ecma::ast::{
-  Decl, Expr, Lit, Module, ModuleDecl, ModuleItem, Stmt, VarDeclKind, VarDeclarator,
+use swc_core::ecma::{
+  ast::{Decl, Expr, Lit, Module, ModuleDecl, ModuleItem, Stmt, VarDeclKind, VarDeclarator},
+  atoms::JsWord,
+  visit::Visit,
 };
-use swc_core::ecma::atoms::JsWord;
-use swc_core::ecma::visit::Visit;
 
 fn is_safe_literal(lit: &Lit) -> bool {
   matches!(
@@ -13,6 +13,29 @@ fn is_safe_literal(lit: &Lit) -> bool {
   )
 }
 
+/// Run analysis over a module to return whether it is a 'constant module'. A constant module is one
+/// which only consists of constant variable declaration export statements and is safe to inline
+/// at its usage site. Declarations are safe if they refer to value type literals (string, bool,
+/// null, big-int, numbers, certain template strings).
+///
+/// For example, this is a constant module:
+/// ```skip
+/// export const ANGLE = 30;
+/// export const COLOR = 'red';
+/// ```
+///
+/// For example, this is not a constant module:
+/// ```skip
+/// bail-out due to non-decl statement:
+/// import {writeFileSync, readFileSync} from 'fs';
+///
+/// // bail-out due to non-decl statement:
+/// writeFileSync('test', 'file');
+///
+/// // bail-out to non constant declarator RHS (only value type literals are supported):
+/// export const COLOR = readFileSync('test');
+///
+/// ```
 pub struct ConstantModule {
   pub is_constant_module: bool,
   constants: HashSet<JsWord>,
@@ -128,17 +151,20 @@ impl Visit for ConstantModule {
 
 #[cfg(test)]
 mod tests {
+  use swc_core::{
+    common::{comments::SingleThreadedComments, sync::Lrc, FileName, Globals, SourceMap},
+    ecma::{
+      parser::{lexer::Lexer, Parser, StringInput},
+      visit::VisitWith,
+    },
+  };
+
   use super::*;
-  use swc_core::common::comments::SingleThreadedComments;
-  use swc_core::common::{sync::Lrc, FileName, Globals, SourceMap};
-  use swc_core::ecma::parser::lexer::Lexer;
-  use swc_core::ecma::parser::{Parser, StringInput};
-  use swc_core::ecma::visit::VisitWith;
   extern crate indoc;
 
   fn is_constant_module(code: &str) -> bool {
     let source_map = Lrc::new(SourceMap::default());
-    let source_file = source_map.new_source_file(FileName::Anon, code.into());
+    let source_file = source_map.new_source_file(Lrc::new(FileName::Anon), code.into());
 
     let comments = SingleThreadedComments::default();
     let lexer = Lexer::new(

@@ -227,7 +227,7 @@ describe('macros', function () {
     await fsFixture(overlayFS, dir)`
       index.js:
         import { test } from "./macro.js" with { type: "macro" };
-        
+
         if (test()) {
           console.log('bad');
         } else {
@@ -396,34 +396,41 @@ describe('macros', function () {
         mode: 'production',
       });
     } catch (err) {
-      assert.deepEqual(err.diagnostics, [
-        {
-          message: `Error loading macro: Could not resolve module "./macro.js" from "${path.join(
-            dir,
-            'index.js',
-          )}"`,
-          origin: '@parcel/transformer-js',
-          codeFrames: [
-            {
-              filePath: path.join(dir, 'index.js'),
-              codeHighlights: [
-                {
-                  message: undefined,
-                  start: {
-                    line: 1,
-                    column: 1,
+      assert.deepEqual(
+        // \ gets escaped by Node -> Rust -> Node in Windows, so we normalize it for the test
+        err.diagnostics.map(d => ({
+          ...d,
+          message: d.message.replace(/\\\\/g, '\\'),
+        })),
+        [
+          {
+            message: `Error loading macro: Could not resolve module "./macro.js" from "${path.join(
+              dir,
+              'index.js',
+            )}"`,
+            origin: '@parcel/transformer-js',
+            codeFrames: [
+              {
+                filePath: path.join(dir, 'index.js'),
+                codeHighlights: [
+                  {
+                    message: undefined,
+                    start: {
+                      line: 1,
+                      column: 1,
+                    },
+                    end: {
+                      line: 1,
+                      column: 57,
+                    },
                   },
-                  end: {
-                    line: 1,
-                    column: 57,
-                  },
-                },
-              ],
-            },
-          ],
-          hints: null,
-        },
-      ]);
+                ],
+              },
+            ],
+            hints: null,
+          },
+        ],
+      );
     }
   });
 
@@ -576,7 +583,7 @@ describe('macros', function () {
     });
 
     let res = await overlayFS.readFile(b.getBundles()[0].filePath, 'utf8');
-    let match = res.match(/output=(\d+)/);
+    let match = res.match(/output=(.*);/);
     assert(match);
 
     b = await bundle(path.join(dir, '/index.js'), {
@@ -586,7 +593,7 @@ describe('macros', function () {
     });
 
     res = await overlayFS.readFile(b.getBundles()[0].filePath, 'utf8');
-    let match2 = res.match(/output=(\d+)/);
+    let match2 = res.match(/output=(.*);/);
     assert(match2);
     assert.notEqual(match[1], match2[1]);
   });

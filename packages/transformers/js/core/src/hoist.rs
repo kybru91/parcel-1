@@ -1,22 +1,28 @@
-use crate::collect::{Collect, Export, Import, ImportKind};
-use crate::utils::{
-  get_undefined_ident, is_unresolved, match_export_name, match_export_name_ident,
-  match_property_name,
+use std::{
+  collections::{hash_map::DefaultHasher, HashMap, HashSet},
+  hash::Hasher,
 };
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
-use std::hash::Hasher;
-use swc_core::common::{Mark, Span, SyntaxContext, DUMMY_SP};
-use swc_core::ecma::ast::*;
-use swc_core::ecma::atoms::{js_word, JsWord};
-use swc_core::ecma::visit::{Fold, FoldWith};
+use swc_core::{
+  common::{Mark, Span, SyntaxContext, DUMMY_SP},
+  ecma::{
+    ast::*,
+    atoms::{js_word, JsWord},
+    utils::stack_size::maybe_grow_default,
+    visit::{Fold, FoldWith},
+  },
+};
 
-use crate::id;
-use crate::utils::{
-  match_import, match_member_expr, match_require, CodeHighlight, Diagnostic, DiagnosticSeverity,
-  SourceLocation,
+use crate::{
+  collect::{Collect, Export, Import, ImportKind},
+  id,
+  utils::{
+    get_undefined_ident, is_unresolved, match_export_name, match_export_name_ident, match_import,
+    match_member_expr, match_property_name, match_require, CodeHighlight, Diagnostic,
+    DiagnosticSeverity, SourceLocation,
+  },
 };
 
 macro_rules! hash {
@@ -44,51 +50,279 @@ pub fn hoist(
   Ok((module, hoist.get_result(), diagnostics))
 }
 
+/// An exported identifier with its original name and new mangled name.
+///
+/// When a file exports a symbol, parcel will rewrite it as a mangled
+/// export identifier.
 #[derive(Debug, Serialize, Deserialize)]
-struct ExportedSymbol {
-  local: JsWord,
-  exported: JsWord,
-  loc: SourceLocation,
-  is_esm: bool,
+pub struct ExportedSymbol {
+  /// The mangled name the transformer has generated and replaced the variable
+  /// uses with
+  pub local: JsWord,
+  /// The original source name that was exported
+  pub exported: JsWord,
+  /// The location of this export
+  pub loc: SourceLocation,
+  pub is_esm: bool,
 }
 
+/// An imported identifier with its rename and original name
+///
+/// For example, if an ESM module import is seen:
+///
+/// ```skip
+/// import { something } from './dependency-source';
+/// ```
+///
+/// The transformer will replace this import statement with a mangled identififer.
+///
+/// * `source` will be `'./dependency-source'`
+/// * `imported` will be `something`
+/// * `local` will usually be a mangled name the transformer has generated and replaced the
+///   call-site with - except for re-exports, in which case it's just the rename
+/// * `loc` will be this source-code location
+///
+/// See [`HoistResult::imported_symbols`] and [`HoistResult::re_exports`].
 #[derive(Debug, Serialize, Deserialize)]
-struct ImportedSymbol {
-  source: JsWord,
-  local: JsWord,
-  imported: JsWord,
-  loc: SourceLocation,
+pub struct ImportedSymbol {
+  /// The specifier for a certain dependency this symbol comes from
+  pub source: JsWord,
+  /// The (usually mangled) local name for a certain imported symbol
+  ///
+  /// On re-exports, this is rather the rename for the import. See `HoistResult::re_exports`.
+  pub local: JsWord,
+  /// The original name for a certain imported symbol
+  pub imported: JsWord,
+  /// A location in the import site
+  pub loc: SourceLocation,
+  /// The type of import this symbol is coming from
   kind: ImportKind,
 }
 
+/// See [`HoistResult`] for field documentation.
 struct Hoist<'a> {
   module_id: &'a str,
   collect: &'a Collect,
   module_items: Vec<ModuleItem>,
   export_decls: HashSet<JsWord>,
   hoisted_imports: IndexMap<JsWord, ModuleItem>,
+  /// See [`HoistResult::imported_symbols`]
   imported_symbols: Vec<ImportedSymbol>,
+  /// See [`HoistResult::exported_symbols`]
   exported_symbols: Vec<ExportedSymbol>,
   re_exports: Vec<ImportedSymbol>,
+  /// See [`HoistResult::self_references`]
   self_references: HashSet<JsWord>,
+  /// See [`HoistResult::dynamic_imports`]
   dynamic_imports: HashMap<JsWord, JsWord>,
   in_function_scope: bool,
   diagnostics: Vec<Diagnostic>,
   unresolved_mark: Mark,
 }
 
+/// Data pertaining to mangled identifiers replacing import and export statements
+/// on transformed files.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct HoistResult {
-  imported_symbols: Vec<ImportedSymbol>,
-  exported_symbols: Vec<ExportedSymbol>,
-  re_exports: Vec<ImportedSymbol>,
-  self_references: HashSet<JsWord>,
-  wrapped_requires: HashSet<String>,
-  dynamic_imports: HashMap<JsWord, JsWord>,
-  static_cjs_exports: bool,
-  has_cjs_exports: bool,
-  is_esm: bool,
-  should_wrap: bool,
+  /// A vector of the symbols imported from other files.
+  ///
+  /// For example, if a source file is:
+  ///
+  /// ```skip
+  /// import { value as v1 } from './dependency-1';
+  /// import { value as v2 } from './dependency-2';
+  ///
+  /// function main() {
+  ///     console.log(v1);
+  ///     console.log(v2);
+  /// }
+  /// ```
+  ///
+  /// The transformer will replace all usages of `v1` and `v2` with a mangled generated name.
+  /// For example, the output will look like:
+  ///
+  /// ```skip
+  /// import './dependency-1';
+  /// import './dependency-2';
+  ///
+  /// function main() {
+  ///     console.log((0, $abc$import$hashfashdfashdfahsdfh_v1));
+  ///     console.log((0, $abc$import$hashfashdfashdfahsdfh_v2));
+  /// }
+  /// ```
+  ///
+  ///
+  /// This `imported_symbols` vector will be:
+  ///
+  /// ```skip
+  /// vec![
+  ///     ImportedSymbol {
+  ///         source: "dependency-1",
+  ///         local: "$abc$import$hashfashdfashdfahsdfh_v1",
+  ///         imported: "value",
+  ///         ...
+  ///     },
+  ///     ImportedSymbol {
+  ///         source: "dependency-2",
+  ///         local: "$abc$import$hashfashdfashdfahsdfh_v2",
+  ///         imported: "value",
+  ///         ...
+  ///     },
+  /// ]
+  /// ```
+  ///
+  /// `local` will be the manged name of the variables.
+  pub imported_symbols: Vec<ImportedSymbol>,
+  /// A vector of the symbols exported from this file, along with their mangled replacement
+  /// identifiers.
+  ///
+  /// For example, if a source file is:
+  ///
+  /// ```skip
+  /// export const x = 1234;
+  /// export function something() {}
+  /// ```
+  ///
+  /// The transformer will replace all usages of `x` and `something` with a mangled generated name.
+  /// For example, the output will look like:
+  ///
+  /// ```skip
+  /// const $abc$export$hashfashdfasdfahsdfh_x = 1234;
+  /// function $abc$export$hashfashdfasdfahsdfh_something() {}
+  /// ```
+  ///
+  ///
+  /// This `exported_symbols` vector will be:
+  ///
+  /// ```skip
+  /// vec![
+  ///     ExportedSymbol {
+  ///         exported: "x",
+  ///         local: "$abc$export$hashfashdfashdfahsdfh_x",
+  ///         ...
+  ///     },
+  ///     ExportedSymbol {
+  ///         exported: "something",
+  ///         local: "$abc$export$hashfashdfashdfahsdfh_something",
+  ///         ...
+  ///     },
+  /// ]
+  /// ```
+  pub exported_symbols: Vec<ExportedSymbol>,
+  /// Symbols re-exported from other modules.
+  ///
+  /// If a symbol is re-exported from another module, parcel will remove the export statement
+  /// from the asset.
+  ///
+  /// For example, if an input file is:
+  ///
+  /// ```skip
+  /// export { view as mainView } from './view';
+  /// ```
+  ///
+  /// The output will be
+  /// ```skip
+  /// import 'abc:./view:esm';
+  /// ```
+  ///
+  /// And this vector will contain the information about the re-exported symbol.
+  ///
+  /// On this case, the fields of `ImportedSymbol` will mean different things than they do for
+  /// [`HoistResult::imported_symbols`].
+  ///
+  /// In particular, since there is no mangled name, `local` means the "exported" name rather than
+  /// the mangled name.
+  ///
+  /// On the case above, this field would be:
+  ///
+  /// ```skip
+  /// vec![
+  ///     ImportedSymbol {
+  ///         source: "./view",
+  ///         local: "mainView",
+  ///         imported: "view",
+  ///         ...
+  ///     },
+  /// ]
+  /// ```
+  ///
+  /// On the case the export statement is an export star:
+  /// ```skip
+  /// export * from './something';
+  /// ```
+  ///
+  /// Then this array will have both `imported` and `local` set to a magic "*" value.
+  pub re_exports: Vec<ImportedSymbol>,
+  /// A vector of the 'original local' names of exported symbols that are self-referenced within the
+  /// file they are being exported from.
+  ///
+  /// For example, if a file is:
+  /// ```skip
+  /// exports.foo = 10;
+  /// exports.something = function() {
+  ///     return exports.foo;
+  /// }
+  /// ```
+  ///
+  /// `self_references` will contain the `foo` symbol, un-mangled. Note the output will be mangled:
+  /// ```skip
+  /// var $abc$export$6a5cdcad01c973fa;
+  /// var $abc$export$ce14ccb78c97a7d4;
+  /// $abc$export$6a5cdcad01c973fa = 10;
+  /// $abc$export$ce14ccb78c97a7d4 = function() {
+  ///     return $abc$export$6a5cdcad01c973fa;
+  /// };
+  /// ```
+  pub self_references: HashSet<JsWord>,
+  /// When require statements are used programmatically, their sources will be collected here.
+  ///
+  /// These would be the module names of dynamically imported or required modules.
+  ///
+  /// TODO: add example
+  pub wrapped_requires: HashSet<String>,
+  /// A map of async import placeholder variable names to source specifiers.
+  ///
+  /// When a dynamic import expression is found in the input file (`import('dependency')`), it is
+  /// replaced with a generated identifier.
+  ///
+  /// This output field contains a map of the generated placeholder variable to the dependency
+  /// specifier (`'dependency'`).
+  ///
+  /// For example, if the source file is
+  ///
+  /// ```skip
+  /// async function run() {
+  ///     const viewModule = await import('./view');
+  ///     viewModule.render();
+  /// }
+  /// ```
+  ///
+  /// And the `module_id` of this file is `"moduleId"`, then the transformer will replace this dynamic
+  /// import (assume `12345` is a hash of the `'view'` value):
+  ///
+  /// ```skip
+  /// async function run() {
+  ///     const viewModule = await $moduleId$importAsync$12345;
+  ///     viewModule.render();
+  /// }
+  /// ```
+  ///
+  /// The `dynamic_imports` field will then be:
+  ///
+  /// ```skip
+  /// {
+  ///     "$moduleId$importAsync$12345": "./view"
+  /// }
+  /// ```
+  ///
+  /// In other words, the keys are the generated identifier names, inserted by the transformer and
+  /// the values, the specifiers on the original source code.
+  pub dynamic_imports: HashMap<JsWord, JsWord>,
+  pub static_cjs_exports: bool,
+  pub has_cjs_exports: bool,
+  pub is_esm: bool,
+  pub should_wrap: bool,
 }
 
 impl<'a> Hoist<'a> {
@@ -320,6 +554,7 @@ impl<'a> Fold for Hoist<'a> {
                   declare: false,
                   kind: VarDeclKind::Var,
                   span: DUMMY_SP,
+                  ctxt: SyntaxContext::empty(),
                   decls: vec![VarDeclarator {
                     definite: false,
                     span: DUMMY_SP,
@@ -388,6 +623,7 @@ impl<'a> Fold for Hoist<'a> {
                           if !decls.is_empty() {
                             let var = VarDecl {
                               span: var.span,
+                              ctxt: var.ctxt,
                               kind: var.kind,
                               declare: var.declare,
                               decls: std::mem::take(&mut decls),
@@ -431,6 +667,7 @@ impl<'a> Fold for Hoist<'a> {
                             if !decls.is_empty() {
                               let var = VarDecl {
                                 span: var.span,
+                                ctxt: var.ctxt,
                                 kind: var.kind,
                                 declare: var.declare,
                                 decls: std::mem::take(&mut decls),
@@ -472,6 +709,7 @@ impl<'a> Fold for Hoist<'a> {
                     if self.module_items.len() > items_len && !decls.is_empty() {
                       let var = VarDecl {
                         span: var.span,
+                        ctxt: var.ctxt,
                         kind: var.kind,
                         declare: var.declare,
                         decls: std::mem::take(&mut decls),
@@ -488,6 +726,7 @@ impl<'a> Fold for Hoist<'a> {
                   if !decls.is_empty() {
                     let var = VarDecl {
                       span: var.span,
+                      ctxt: var.ctxt,
                       kind: var.kind,
                       declare: var.declare,
                       decls,
@@ -693,7 +932,7 @@ impl<'a> Fold for Hoist<'a> {
           ));
         }
 
-        if let Some(source) = match_import(&node, self.collect.ignore_mark) {
+        if let Some(source) = match_import(&node) {
           self.add_require(&source, ImportKind::DynamicImport);
           let name: JsWord = format!("${}$importAsync${:x}", self.module_id, hash!(source)).into();
           self.dynamic_imports.insert(name.clone(), source.clone());
@@ -706,7 +945,7 @@ impl<'a> Fold for Hoist<'a> {
               kind: ImportKind::DynamicImport,
             });
           }
-          return Expr::Ident(Ident::new(name, call.span));
+          return Expr::Ident(Ident::new(name, call.span, call.ctxt));
         }
       }
       Expr::This(this) => {
@@ -740,7 +979,7 @@ impl<'a> Fold for Hoist<'a> {
       _ => {}
     }
 
-    node.fold_children_with(self)
+    maybe_grow_default(|| node.fold_children_with(self))
   }
 
   fn fold_seq_expr(&mut self, node: SeqExpr) -> SeqExpr {
@@ -855,15 +1094,15 @@ impl<'a> Fold for Hoist<'a> {
     }
 
     if node.sym == js_word!("global") && is_unresolved(&node, self.unresolved_mark) {
-      return Ident::new("$parcel$global".into(), node.span);
+      return Ident::new("$parcel$global".into(), node.span, node.ctxt);
     }
 
-    if node.span.has_mark(self.collect.global_mark)
+    if node.ctxt.has_mark(self.collect.global_mark)
       && !is_unresolved(&node, self.unresolved_mark)
       && !self.collect.should_wrap
     {
       let new_name: JsWord = format!("${}$var${}", self.module_id, node.sym).into();
-      return Ident::new(new_name, node.span);
+      return Ident::new(new_name, node.span, node.ctxt);
     }
 
     node
@@ -874,21 +1113,13 @@ impl<'a> Fold for Hoist<'a> {
       return node.fold_children_with(self);
     }
 
-    let expr = match &node.left {
-      PatOrExpr::Expr(expr) => expr,
-      PatOrExpr::Pat(pat) => match &**pat {
-        Pat::Expr(expr) => expr,
-        _ => return node.fold_children_with(self),
-      },
-    };
-
-    if let Expr::Member(member) = &**expr {
+    if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &node.left {
       if match_member_expr(member, vec!["module", "exports"], self.unresolved_mark) {
         let ident = BindingIdent::from(self.get_export_ident(member.span, &"*".into()));
         return AssignExpr {
           span: node.span,
           op: node.op,
-          left: PatOrExpr::Pat(Box::new(Pat::Ident(ident))),
+          left: AssignTarget::Simple(SimpleAssignTarget::Ident(ident.into())),
           right: node.right.fold_with(self),
         };
       }
@@ -923,12 +1154,14 @@ impl<'a> Fold for Hoist<'a> {
               declare: false,
               kind: VarDeclKind::Var,
               span: node.span,
+              ctxt: ident.ctxt,
               decls: vec![VarDeclarator {
                 definite: false,
                 span: node.span,
                 name: Pat::Ident(BindingIdent::from(Ident::new(
                   ident.id.sym.clone(),
                   DUMMY_SP,
+                  ident.ctxt,
                 ))),
                 init: None,
               }],
@@ -940,13 +1173,13 @@ impl<'a> Fold for Hoist<'a> {
           span: node.span,
           op: node.op,
           left: if self.collect.static_cjs_exports {
-            PatOrExpr::Pat(Box::new(Pat::Ident(ident)))
+            AssignTarget::Simple(SimpleAssignTarget::Ident(ident.into()))
           } else {
-            PatOrExpr::Pat(Box::new(Pat::Expr(Box::new(Expr::Member(MemberExpr {
+            AssignTarget::Simple(SimpleAssignTarget::Member(MemberExpr {
               span: member.span,
               obj: Box::new(Expr::Ident(ident.id)),
               prop: member.prop.clone().fold_with(self),
-            })))))
+            }))
           },
           right: node.right.fold_with(self),
         };
@@ -959,7 +1192,7 @@ impl<'a> Fold for Hoist<'a> {
   fn fold_prop(&mut self, node: Prop) -> Prop {
     match node {
       Prop::Shorthand(ident) => Prop::KeyValue(KeyValueProp {
-        key: PropName::Ident(Ident::new(ident.sym.clone(), DUMMY_SP)),
+        key: PropName::Ident(IdentName::new(ident.sym.clone(), DUMMY_SP)),
         value: Box::new(Expr::Ident(ident.fold_with(self))),
       }),
       _ => node.fold_children_with(self),
@@ -981,7 +1214,7 @@ impl<'a> Fold for Hoist<'a> {
     // var {a, b} = foo; -> var {a: $id$var$a, b: $id$var$b} = foo;
     match node {
       ObjectPatProp::Assign(assign) => ObjectPatProp::KeyValue(KeyValuePatProp {
-        key: PropName::Ident(Ident::new(assign.key.sym.clone(), DUMMY_SP)),
+        key: PropName::Ident(IdentName::new(assign.key.sym.clone(), DUMMY_SP)),
         value: Box::new(match assign.value {
           Some(value) => Pat::Assign(AssignPat {
             left: Box::new(Pat::Ident(BindingIdent::from(assign.key.fold_with(self)))),
@@ -1044,11 +1277,11 @@ impl<'a> Hoist<'a> {
       loc,
       kind,
     });
-    Ident::new(new_name, span)
+    Ident::new_no_ctxt(new_name, span)
   }
 
   fn get_require_ident(&self, local: &JsWord) -> Ident {
-    Ident::new(
+    Ident::new_no_ctxt(
       format!("${}$require${}", self.module_id, local).into(),
       DUMMY_SP,
     )
@@ -1073,9 +1306,7 @@ impl<'a> Hoist<'a> {
       is_esm,
     });
 
-    let mut span = span;
-    span.ctxt = SyntaxContext::empty();
-    Ident::new(new_name, span)
+    Ident::new_no_ctxt(new_name, span)
   }
 
   fn handle_non_const_require(&mut self, v: &VarDeclarator, source: &JsWord) {
@@ -1107,6 +1338,7 @@ impl<'a> Hoist<'a> {
             declare: false,
             kind: VarDeclKind::Var,
             span: DUMMY_SP,
+            ctxt: SyntaxContext::empty(),
             decls: vec![VarDeclarator {
               definite: false,
               span: DUMMY_SP,
@@ -1121,23 +1353,24 @@ impl<'a> Hoist<'a> {
 
 #[cfg(test)]
 mod tests {
+  use swc_core::{
+    common::{comments::SingleThreadedComments, sync::Lrc, FileName, Globals, SourceMap},
+    ecma::{
+      codegen::text_writer::JsWriter,
+      parser::{lexer::Lexer, Parser, StringInput},
+      transforms::base::{fixer::fixer, hygiene::hygiene, resolver},
+      visit::{VisitMutWith, VisitWith},
+    },
+  };
+
   use super::*;
   use crate::utils::BailoutReason;
-  use std::iter::FromIterator;
-  use swc_core::common::chain;
-  use swc_core::common::comments::SingleThreadedComments;
-  use swc_core::common::{sync::Lrc, FileName, Globals, Mark, SourceMap};
-  use swc_core::ecma::codegen::text_writer::JsWriter;
-  use swc_core::ecma::parser::lexer::Lexer;
-  use swc_core::ecma::parser::{Parser, StringInput};
-  use swc_core::ecma::transforms::base::{fixer::fixer, hygiene::hygiene, resolver};
-  use swc_core::ecma::visit::VisitWith;
   extern crate indoc;
   use self::indoc::indoc;
 
   fn parse(code: &str) -> (Collect, String, HoistResult) {
     let source_map = Lrc::new(SourceMap::default());
-    let source_file = source_map.new_source_file(FileName::Anon, code.into());
+    let source_file = source_map.new_source_file(Lrc::new(FileName::Anon), code.into());
 
     let comments = SingleThreadedComments::default();
     let lexer = Lexer::new(
@@ -1149,11 +1382,15 @@ mod tests {
 
     let mut parser = Parser::new_from(lexer);
     match parser.parse_program() {
-      Ok(program) => swc_core::common::GLOBALS.set(&Globals::new(), || {
+      Ok(mut program) => swc_core::common::GLOBALS.set(&Globals::new(), || {
         swc_core::ecma::transforms::base::helpers::HELPERS.set(
           &swc_core::ecma::transforms::base::helpers::Helpers::new(false),
           || {
             let is_module = program.is_module();
+            let unresolved_mark = Mark::fresh(Mark::root());
+            let global_mark = Mark::fresh(Mark::root());
+            program.mutate(&mut resolver(unresolved_mark, global_mark, false));
+
             let module = match program {
               Program::Module(module) => module,
               Program::Script(script) => Module {
@@ -1162,10 +1399,6 @@ mod tests {
                 body: script.body.into_iter().map(ModuleItem::Stmt).collect(),
               },
             };
-
-            let unresolved_mark = Mark::fresh(Mark::root());
-            let global_mark = Mark::fresh(Mark::root());
-            let module = module.fold_with(&mut resolver(unresolved_mark, global_mark, false));
 
             let mut collect = Collect::new(
               source_map.clone(),
@@ -1177,13 +1410,13 @@ mod tests {
             );
             module.visit_with(&mut collect);
 
-            let (module, res) = {
+            let (mut module, res) = {
               let mut hoist = Hoist::new("abc", unresolved_mark, &collect);
               let module = module.fold_with(&mut hoist);
               (module, hoist.get_result())
             };
 
-            let module = module.fold_with(&mut chain!(hygiene(), fixer(Some(&comments))));
+            module.visit_mut_with(&mut (hygiene(), fixer(Some(&comments))));
 
             let code = emit(source_map, comments, &module);
             (collect, code, res)
@@ -1424,6 +1657,25 @@ mod tests {
       map! { w!("bar") => (w!("other"), w!("foo"), false) }
     );
     assert!(collect.static_cjs_exports);
+  }
+
+  #[test]
+  fn collect_destructure_default() {
+    let (collect, _code, _hoist) = parse(
+      r#"
+    import {bar} from 'source';
+
+    export function thing(props) {
+      const {something = bar} = props;
+      return something;
+    }
+    "#,
+    );
+    assert_eq_imports!(
+      collect.imports,
+      map! { w!("bar") => (w!("source"), w!("bar"), false) }
+    );
+    assert_eq_set!(collect.used_imports, set! { w!("bar") });
   }
 
   #[test]
@@ -2904,6 +3156,142 @@ mod tests {
     console.log($abc$var$module.exports.foo);
     "#}
     );
+  }
+
+  #[test]
+  fn test_parse_self_reference() {
+    let (_collect, code, hoist) = parse(
+      r#"
+    exports.foo = 10;
+    exports.something = function() {
+       return exports.foo;
+    }
+    "#,
+    );
+
+    assert_eq!(
+      code,
+      indoc! {r#"
+    var $abc$export$6a5cdcad01c973fa;
+    var $abc$export$ce14ccb78c97a7d4;
+    $abc$export$6a5cdcad01c973fa = 10;
+    $abc$export$ce14ccb78c97a7d4 = function() {
+        return $abc$export$6a5cdcad01c973fa;
+    };
+    "#}
+    );
+    assert_eq!(
+      hoist
+        .self_references
+        .iter()
+        .cloned()
+        .collect::<Vec<JsWord>>(),
+      vec![JsWord::from("foo")]
+    );
+    assert_eq!(hoist.exported_symbols.len(), 3);
+    // First exported symbol is `export foo`
+    assert_eq!(
+      hoist.exported_symbols[0].local,
+      JsWord::from("$abc$export$6a5cdcad01c973fa")
+    );
+    assert_eq!(hoist.exported_symbols[0].exported, JsWord::from("foo"));
+
+    // Second is `export something`
+    assert_eq!(
+      hoist.exported_symbols[1].local,
+      JsWord::from("$abc$export$ce14ccb78c97a7d4")
+    );
+    assert_eq!(
+      hoist.exported_symbols[1].exported,
+      JsWord::from("something")
+    );
+
+    // Third is `export foo` again, but on the something location
+    assert_eq!(
+      hoist.exported_symbols[2].local,
+      JsWord::from("$abc$export$6a5cdcad01c973fa")
+    );
+    assert_eq!(hoist.exported_symbols[2].exported, JsWord::from("foo"));
+
+    assert_ne!(hoist.exported_symbols[2].loc, hoist.exported_symbols[0].loc);
+  }
+
+  #[test]
+  fn test_parse_module_exports() {
+    let (_collect, code, hoist) = parse(
+      r#"
+    module.exports.foo = 10;
+    "#,
+    );
+
+    assert_eq!(
+      code,
+      indoc! {r#"
+    var $abc$export$6a5cdcad01c973fa;
+    $abc$export$6a5cdcad01c973fa = 10;
+    "#}
+    );
+    assert_eq!(hoist.self_references.len(), 0);
+    assert_eq!(hoist.exported_symbols.len(), 1);
+    assert_eq!(
+      hoist.exported_symbols[0].local,
+      JsWord::from("$abc$export$6a5cdcad01c973fa")
+    );
+    assert_eq!(hoist.exported_symbols[0].exported, JsWord::from("foo"));
+  }
+
+  #[test]
+  fn test_parse_this() {
+    let (_collect, code, hoist) = parse(
+      r#"
+    this.foo = 10;
+    "#,
+    );
+
+    assert_eq!(
+      code,
+      indoc! {r#"
+    var $abc$export$6a5cdcad01c973fa;
+    $abc$export$6a5cdcad01c973fa = 10;
+    "#}
+    );
+    assert_eq!(hoist.self_references.len(), 0);
+    assert_eq!(hoist.exported_symbols.len(), 1);
+    assert_eq!(
+      hoist.exported_symbols[0].local,
+      JsWord::from("$abc$export$6a5cdcad01c973fa")
+    );
+    assert_eq!(hoist.exported_symbols[0].exported, JsWord::from("foo"));
+  }
+
+  #[test]
+  fn test_parse_import_statement() {
+    let (_collect, code, hoist) = parse(
+      r#"
+    import { x } from 'other';
+    async function test() {
+      console.log(x.foo);
+    }
+    "#,
+    );
+
+    assert_eq!(
+      code,
+      indoc! {r#"
+    import "abc:other:esm";
+    async function $abc$var$test() {
+        console.log((0, $abc$import$70a00e0a8474f72a$d141bba7fdc215a3).foo);
+    }
+    "#}
+    );
+    assert_eq!(hoist.imported_symbols.len(), 1);
+    assert_eq!(hoist.imported_symbols[0].imported, JsWord::from("x"));
+    assert_eq!(
+      hoist.imported_symbols[0].local,
+      JsWord::from("$abc$import$70a00e0a8474f72a$d141bba7fdc215a3")
+    );
+    assert_eq!(hoist.imported_symbols[0].source, JsWord::from("other"));
+    assert_eq!(hoist.imported_symbols[0].kind, ImportKind::Import);
   }
 
   #[test]

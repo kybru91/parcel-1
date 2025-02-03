@@ -1,20 +1,26 @@
+use std::{
+  collections::hash_map::DefaultHasher,
+  fmt,
+  hash::{Hash, Hasher},
+  path::Path,
+};
+
+use bitflags::bitflags;
+use parcel_macros::{Evaluator, JsValue};
 use path_slash::PathBufExt;
-use std::collections::HashMap;
-use std::fmt;
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
-use swc_core::common::{Mark, SourceMap, Span, DUMMY_SP};
-use swc_core::ecma::ast::{self, Callee, MemberProp};
-use swc_core::ecma::atoms::{js_word, JsWord};
-use swc_core::ecma::visit::{Fold, FoldWith};
+use swc_core::{
+  common::{sync::Lrc, Mark, SourceMap, Span, SyntaxContext, DUMMY_SP},
+  ecma::{
+    ast::{self, Callee, MemberProp, Module},
+    atoms::{js_word, JsWord},
+    utils::{member_expr, stack_size::maybe_grow_default},
+    visit::{Fold, FoldWith},
+  },
+};
 
-use crate::fold_member_expr_skip_prop;
-use crate::utils::*;
-use crate::Config;
+use crate::{fold_member_expr_skip_prop, utils::*, Config};
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 macro_rules! hash {
   ($str:expr) => {{
     let mut hasher = DefaultHasher::new();
@@ -25,15 +31,91 @@ macro_rules! hash {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DependencyKind {
+  /// Corresponds to ESM import statements
+  /// ```skip
+  /// import {x} from './dependency';
+  /// ```
   Import,
+  /// Corresponds to ESM re-export statements
+  /// ```skip
+  /// export {x} from './dependency';
+  /// ```
   Export,
+  /// Corresponds to dynamic import statements
+  /// ```skip
+  /// import('./dependency').then(({x}) => {/* ... */});
+  /// ```
   DynamicImport,
+  /// Corresponds to CJS require statements
+  /// ```skip
+  /// const {x} = require('./dependency');
+  /// ```
   Require,
+  /// Corresponds to Worker URL statements
+  /// ```skip
+  /// const worker = new Worker(
+  ///     new URL('./dependency', import.meta.url),
+  ///     {type: 'module'}
+  /// );
+  /// ```
   WebWorker,
+  /// Corresponds to ServiceWorker URL statements
+  /// ```skip
+  /// navigator.serviceWorker.register(
+  ///     new URL('./dependency', import.meta.url),
+  ///     {type: 'module'}
+  /// );
+  /// ```
   ServiceWorker,
+  /// CSS / WebAudio worklets
+  /// ```skip
+  /// CSS.paintWorklet.addModule(
+  ///   new URL('./dependency', import.meta.url)
+  /// );
+  /// ```
   Worklet,
+  /// URL statements
+  /// ```skip
+  /// let img = document.createElement('img');
+  /// img.src = new URL('hero.jpg', import.meta.url);
+  /// document.body.appendChild(img);
+  /// ```
   Url,
+  /// `fs.readFileSync` statements
+  ///
+  /// > Calls to fs.readFileSync are replaced with the file's contents if the filepath is statically
+  /// > determinable and inside the project root.
+  ///
+  /// ```skip
+  /// import fs from "fs";
+  /// import path from "path";
+  ///
+  /// const data = fs.readFileSync(path.join(__dirname, "data.json"), "utf8");
+  /// ```
+  ///
+  /// * https://parceljs.org/features/node-emulation/#inlining-fs.readfilesync
   File,
+  /// `parcelRequire` call.
+  Id,
+}
+
+bitflags! {
+  #[derive(Serialize, Deserialize, Default)]
+  #[serde(transparent)]
+  pub struct Helpers: u8 {
+    /// `import.meta.distDir` – a relative path from the current bundle to the distDir
+    const DIST_DIR = 1 << 0;
+    /// `import.meta.publicUrl` - absolute public URL
+    const PUBLIC_URL = 1 << 1;
+    /// `parcelRequire.load`
+    const LOAD = 1 << 2;
+    /// `parcelRequire.resolve`
+    const RESOLVE = 1 << 3;
+    /// `parcelRequire.extendImportMap`
+    const EXTEND_IMPORT_MAP = 1 << 4;
+    /// `import.meta.devServer` – URL of Parcel HMR server
+    const DEV_SERVER = 1 << 5;
+  }
 }
 
 impl fmt::Display for DependencyKind {
@@ -42,29 +124,40 @@ impl fmt::Display for DependencyKind {
   }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+bitflags! {
+  #[derive(Serialize, Deserialize, Default)]
+  #[serde(transparent)]
+  pub struct DependencyFlags: u8 {
+    const OPTIONAL = 1 << 0;
+    const HELPER = 1 << 1;
+    const NEEDS_STABLE_NAME = 1 << 2;
+    const REACT_LAZY = 1 << 3;
+  }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DependencyDescriptor {
   pub kind: DependencyKind,
   pub loc: SourceLocation,
   /// The text specifier associated with the import/export statement.
   pub specifier: swc_core::ecma::atoms::JsWord,
-  pub attributes: Option<HashMap<swc_core::ecma::atoms::JsWord, bool>>,
-  pub is_optional: bool,
-  pub is_helper: bool,
+  pub attributes: Option<JsValue>,
+  pub flags: DependencyFlags,
   pub source_type: Option<SourceType>,
   pub placeholder: Option<String>,
 }
 
 /// This pass collects dependencies in a module and compiles references as needed to work with Parcel's JSRuntime.
 pub fn dependency_collector<'a>(
-  source_map: &'a SourceMap,
+  module: Module,
+  source_map: Lrc<SourceMap>,
   items: &'a mut Vec<DependencyDescriptor>,
   ignore_mark: swc_core::common::Mark,
   unresolved_mark: swc_core::common::Mark,
   config: &'a Config,
   diagnostics: &'a mut Vec<Diagnostic>,
-) -> impl Fold + 'a {
-  DependencyCollector {
+) -> (Module, Helpers) {
+  let mut collector = DependencyCollector {
     source_map,
     items,
     in_try: false,
@@ -75,11 +168,15 @@ pub fn dependency_collector<'a>(
     config,
     diagnostics,
     import_meta: None,
-  }
+    helpers: Helpers::empty(),
+  };
+
+  let module = module.fold_with(&mut collector);
+  (module, collector.helpers)
 }
 
 struct DependencyCollector<'a> {
-  source_map: &'a SourceMap,
+  source_map: Lrc<SourceMap>,
   items: &'a mut Vec<DependencyDescriptor>,
   in_try: bool,
   in_promise: bool,
@@ -89,6 +186,7 @@ struct DependencyCollector<'a> {
   config: &'a Config,
   diagnostics: &'a mut Vec<Diagnostic>,
   import_meta: Option<ast::VarDecl>,
+  helpers: Helpers,
 }
 
 impl<'a> DependencyCollector<'a> {
@@ -97,9 +195,10 @@ impl<'a> DependencyCollector<'a> {
     mut specifier: JsWord,
     span: swc_core::common::Span,
     kind: DependencyKind,
-    attributes: Option<HashMap<swc_core::ecma::atoms::JsWord, bool>>,
+    attributes: Option<JsValue>,
     is_optional: bool,
     source_type: SourceType,
+    needs_stable_name: bool,
   ) -> Option<JsWord> {
     // Rewrite SWC helpers from ESM to CJS for library output.
     let mut is_specifier_rewritten = false;
@@ -134,13 +233,17 @@ impl<'a> DependencyCollector<'a> {
       _ => None,
     };
 
+    let mut flags = DependencyFlags::empty();
+    flags.set(DependencyFlags::OPTIONAL, is_optional);
+    flags.set(DependencyFlags::HELPER, span.is_dummy());
+    flags.set(DependencyFlags::NEEDS_STABLE_NAME, needs_stable_name);
+
     self.items.push(DependencyDescriptor {
       kind,
-      loc: SourceLocation::from(self.source_map, span),
+      loc: SourceLocation::from(&self.source_map, span),
       specifier,
       attributes,
-      is_optional,
-      is_helper: span.is_dummy(),
+      flags,
       source_type: Some(source_type),
       placeholder: placeholder.clone(),
     });
@@ -154,11 +257,19 @@ impl<'a> DependencyCollector<'a> {
     span: swc_core::common::Span,
     kind: DependencyKind,
     source_type: SourceType,
+    needs_stable_name: bool,
   ) -> ast::Expr {
     // If not a library, replace with a require call pointing to a runtime that will resolve the url dynamically.
     if !self.config.is_library && !self.config.standalone {
-      let placeholder =
-        self.add_dependency(specifier.clone(), span, kind, None, false, source_type);
+      let placeholder = self.add_dependency(
+        specifier.clone(),
+        span,
+        kind,
+        None,
+        false,
+        source_type,
+        needs_stable_name,
+      );
       let specifier = if let Some(placeholder) = placeholder {
         placeholder
       } else {
@@ -181,13 +292,15 @@ impl<'a> DependencyCollector<'a> {
         ))
       )
     };
+    let mut flags = DependencyFlags::empty();
+    flags.set(DependencyFlags::OPTIONAL, span.is_dummy());
+    flags.set(DependencyFlags::NEEDS_STABLE_NAME, needs_stable_name);
     self.items.push(DependencyDescriptor {
       kind,
-      loc: SourceLocation::from(self.source_map, span),
+      loc: SourceLocation::from(&self.source_map, span),
       specifier,
       attributes: None,
-      is_optional: false,
-      is_helper: span.is_dummy(),
+      flags,
       source_type: Some(source_type),
       placeholder: Some(placeholder.clone()),
     });
@@ -204,7 +317,7 @@ impl<'a> DependencyCollector<'a> {
     // For scripts, we replace with __parcel__require__, which is later replaced
     // by a real parcelRequire of the resolved asset in the packager.
     if self.config.source_type == SourceType::Script {
-      res.callee = ast::Callee::Expr(Box::new(ast::Expr::Ident(ast::Ident::new(
+      res.callee = ast::Callee::Expr(Box::new(ast::Expr::Ident(ast::Ident::new_no_ctxt(
         "__parcel__require__".into(),
         DUMMY_SP,
       ))));
@@ -222,7 +335,7 @@ impl<'a> DependencyCollector<'a> {
       message: "SCRIPT_ERROR".to_string(),
       code_highlights: Some(vec![CodeHighlight {
         message: None,
-        loc: SourceLocation::from(self.source_map, span),
+        loc: SourceLocation::from(&self.source_map, span),
       }]),
       hints: None,
       show_environment: true,
@@ -283,13 +396,20 @@ impl<'a> Fold for DependencyCollector<'a> {
       return node;
     }
 
+    let evaluator = Evaluator::new(&self.source_map);
+    let attributes = node
+      .with
+      .as_ref()
+      .and_then(|attrs| evaluator.eval_object(&*attrs).ok());
+
     let rewritten = self.add_dependency(
       node.src.value.clone(),
       node.src.span,
       DependencyKind::Import,
-      None,
+      attributes,
       false,
       self.config.source_type,
+      false,
     );
 
     if let Some(rewritten) = rewritten {
@@ -305,13 +425,20 @@ impl<'a> Fold for DependencyCollector<'a> {
         return node;
       }
 
+      let evaluator = Evaluator::new(&self.source_map);
+      let attributes = node
+        .with
+        .as_ref()
+        .and_then(|attrs| evaluator.eval_object(&*attrs).ok());
+
       let rewritten = self.add_dependency(
         src.value.clone(),
         src.span,
         DependencyKind::Export,
-        None,
+        attributes,
         false,
         self.config.source_type,
+        false,
       );
 
       if let Some(rewritten) = rewritten {
@@ -323,13 +450,20 @@ impl<'a> Fold for DependencyCollector<'a> {
   }
 
   fn fold_export_all(&mut self, mut node: ast::ExportAll) -> ast::ExportAll {
+    let evaluator = Evaluator::new(&self.source_map);
+    let attributes = node
+      .with
+      .as_ref()
+      .and_then(|attrs| evaluator.eval_object(&*attrs).ok());
+
     let rewritten = self.add_dependency(
       node.src.value.clone(),
       node.src.span,
       DependencyKind::Export,
-      None,
+      attributes,
       false,
       self.config.source_type,
+      false,
     );
 
     if let Some(rewritten) = rewritten {
@@ -357,7 +491,7 @@ impl<'a> Fold for DependencyCollector<'a> {
   }
 
   fn fold_call_expr(&mut self, node: ast::CallExpr) -> ast::CallExpr {
-    use ast::{Expr::*, Ident};
+    use ast::Expr::*;
 
     let kind = match &node.callee {
       Callee::Import(_) => DependencyKind::DynamicImport,
@@ -378,7 +512,7 @@ impl<'a> Fold for DependencyCollector<'a> {
                 }
               }
               "importScripts" => {
-                if self.config.is_worker {
+                if self.config.is_worker() {
                   let (msg, span) = if self.config.source_type == SourceType::Script {
                     // Ignore if argument is not a string literal.
                     let span = if let Some(ast::ExprOrSpread { expr, .. }) = node.args.first() {
@@ -415,7 +549,7 @@ impl<'a> Fold for DependencyCollector<'a> {
                     message: msg.to_string(),
                     code_highlights: Some(vec![CodeHighlight {
                       message: None,
-                      loc: SourceLocation::from(self.source_map, span),
+                      loc: SourceLocation::from(&self.source_map, span),
                     }]),
                     hints: Some(vec![String::from(
                       "Use a static `import`, or dynamic `import()` instead.",
@@ -434,7 +568,8 @@ impl<'a> Fold for DependencyCollector<'a> {
                 let mut call = node.fold_children_with(self);
                 call.callee = ast::Callee::Expr(Box::new(ast::Expr::Ident(ast::Ident::new(
                   "require".into(),
-                  DUMMY_SP.apply_mark(self.ignore_mark),
+                  DUMMY_SP,
+                  SyntaxContext::empty().apply_mark(self.ignore_mark),
                 ))));
                 return call;
               }
@@ -442,7 +577,8 @@ impl<'a> Fold for DependencyCollector<'a> {
                 let mut call = node.fold_children_with(self);
                 call.callee = ast::Callee::Expr(Box::new(ast::Expr::Ident(ast::Ident::new(
                   "import".into(),
-                  DUMMY_SP.apply_mark(self.ignore_mark),
+                  DUMMY_SP,
+                  SyntaxContext::empty().apply_mark(self.ignore_mark),
                 ))));
                 return call;
               }
@@ -450,17 +586,95 @@ impl<'a> Fold for DependencyCollector<'a> {
                 let mut call = node.fold_children_with(self);
                 call.callee = ast::Callee::Expr(Box::new(ast::Expr::Ident(ast::Ident::new(
                   "importScripts".into(),
-                  DUMMY_SP.apply_mark(self.ignore_mark),
+                  DUMMY_SP,
+                  SyntaxContext::empty().apply_mark(self.ignore_mark),
                 ))));
+                return call;
+              }
+              "parcelRequire" => {
+                if let Some(ast::ExprOrSpread { expr, .. }) = node.args.first() {
+                  if let Some((id, span)) = match_str(expr) {
+                    self.items.push(DependencyDescriptor {
+                      kind: DependencyKind::Id,
+                      loc: SourceLocation::from(&self.source_map, span),
+                      specifier: id,
+                      attributes: None,
+                      flags: DependencyFlags::empty(),
+                      source_type: None,
+                      placeholder: None,
+                    });
+                  }
+                }
+                let mut call = node.fold_children_with(self);
+                if !self.config.scope_hoist {
+                  call.callee = ast::Callee::Expr(Box::new(ast::Expr::Member(member_expr!(
+                    Default::default(),
+                    call.span,
+                    module.bundle.root
+                  ))));
+                }
                 return call;
               }
               _ => return node.fold_children_with(self),
             }
           }
           Member(member) => {
-            if match_member_expr(member, vec!["module", "require"], self.unresolved_mark) {
+            if match_member_expr(member, vec!["parcelRequire", "load"], self.unresolved_mark) {
+              let mut call = node.fold_children_with(self);
+              let callee = if self.config.scope_hoist {
+                ast::Expr::Ident(ast::Ident::new_no_ctxt("$parcel$import".into(), call.span))
+              } else {
+                ast::Expr::Member(member_expr!(
+                  Default::default(),
+                  call.span,
+                  module.bundle.load
+                ))
+              };
+              call.callee = ast::Callee::Expr(Box::new(callee));
+              self.helpers |= Helpers::LOAD;
+              return call;
+            } else if match_member_expr(
+              member,
+              vec!["parcelRequire", "resolve"],
+              self.unresolved_mark,
+            ) {
+              let mut call = node.fold_children_with(self);
+              let callee = if self.config.scope_hoist {
+                ast::Expr::Ident(ast::Ident::new_no_ctxt("$parcel$resolve".into(), call.span))
+              } else {
+                ast::Expr::Member(member_expr!(
+                  Default::default(),
+                  call.span,
+                  module.bundle.resolve
+                ))
+              };
+              call.callee = ast::Callee::Expr(Box::new(callee));
+              self.helpers |= Helpers::RESOLVE;
+              return call;
+            } else if match_member_expr(
+              member,
+              vec!["parcelRequire", "extendImportMap"],
+              self.unresolved_mark,
+            ) {
+              let mut call = node.fold_children_with(self);
+              let callee = if self.config.scope_hoist {
+                ast::Expr::Ident(ast::Ident::new_no_ctxt(
+                  "$parcel$extendImportMap".into(),
+                  call.span,
+                ))
+              } else {
+                ast::Expr::Member(member_expr!(
+                  Default::default(),
+                  call.span,
+                  module.bundle.extendImportMap
+                ))
+              };
+              call.callee = ast::Callee::Expr(Box::new(callee));
+              self.helpers |= Helpers::EXTEND_IMPORT_MAP;
+              return call;
+            } else if match_member_expr(member, vec!["module", "require"], self.unresolved_mark) {
               DependencyKind::Require
-            } else if self.config.is_browser
+            } else if self.config.is_browser()
               && match_member_expr(
                 member,
                 vec!["navigator", "serviceWorker", "register"],
@@ -468,7 +682,7 @@ impl<'a> Fold for DependencyCollector<'a> {
               )
             {
               DependencyKind::ServiceWorker
-            } else if self.config.is_browser
+            } else if self.config.is_browser()
               && match_member_expr(
                 member,
                 vec!["CSS", "paintWorklet", "addModule"],
@@ -504,10 +718,10 @@ impl<'a> Fold for DependencyCollector<'a> {
                 if let Callee::Expr(e) = &call.callee {
                   if let Member(m) = &**e {
                     if match_member_expr(m, vec!["Promise", "resolve"], self.unresolved_mark) &&
-                      // Make sure the arglist is empty.
-                      // I.e. do not proceed with the below unless Promise.resolve has an empty arglist
-                      // because build_promise_chain() will not work in this case.
-                      call.args.is_empty()
+                        // Make sure the arglist is empty.
+                        // I.e. do not proceed with the below unless Promise.resolve has an empty arglist
+                        // because build_promise_chain() will not work in this case.
+                        call.args.is_empty()
                     {
                       if let MemberProp::Ident(id) = &member.prop {
                         if id.sym.to_string().as_str() == "then" {
@@ -515,8 +729,7 @@ impl<'a> Fold for DependencyCollector<'a> {
                             match &*arg.expr {
                               Fn(_) | Arrow(_) => {
                                 self.in_promise = true;
-                                let node =
-                                  swc_core::ecma::visit::fold_call_expr(self, node.clone());
+                                let node = node.clone().fold_children_with(self);
                                 self.in_promise = was_in_promise;
 
                                 // Transform Promise.resolve().then(() => __importStar(require('foo')))
@@ -549,38 +762,14 @@ impl<'a> Fold for DependencyCollector<'a> {
     let mut attributes = None;
     if kind == DependencyKind::DynamicImport {
       if let Some(arg) = node.args.get(1) {
-        if let Object(arg) = &*arg.expr {
-          let mut attrs = HashMap::new();
-          for key in &arg.props {
-            let prop = match key {
-              ast::PropOrSpread::Prop(prop) => prop,
-              _ => continue,
-            };
-
-            let kv = match &**prop {
-              ast::Prop::KeyValue(kv) => kv,
-              _ => continue,
-            };
-
-            let k = match &kv.key {
-              ast::PropName::Ident(Ident { sym, .. })
-              | ast::PropName::Str(ast::Str { value: sym, .. }) => sym.clone(),
-              _ => continue,
-            };
-
-            let v = match &*kv.value {
-              Lit(ast::Lit::Bool(ast::Bool { value, .. })) => *value,
-              _ => continue,
-            };
-
-            attrs.insert(k, v);
-          }
-
-          attributes = Some(attrs);
+        if let Object(_) = &*arg.expr {
+          let evaluator = Evaluator::new(&self.source_map);
+          attributes = evaluator.eval(&*arg.expr).ok();
         }
       }
     }
 
+    let mut is_specifier_str = false;
     let node = if let Some(arg) = node.args.first() {
       if kind == DependencyKind::ServiceWorker || kind == DependencyKind::Worklet {
         let (source_type, opts) = if kind == DependencyKind::ServiceWorker {
@@ -591,7 +780,7 @@ impl<'a> Fold for DependencyCollector<'a> {
         };
         let mut node = node.clone();
 
-        let (specifier, span) = if let Some(s) = self.match_new_url(&arg.expr) {
+        let (specifier, span, needs_stable_name) = if let Some(s) = self.match_new_url(&arg.expr) {
           s
         } else if let Lit(ast::Lit::Str(str_)) = &*arg.expr {
           let (msg, docs) = if kind == DependencyKind::ServiceWorker {
@@ -609,7 +798,7 @@ impl<'a> Fold for DependencyCollector<'a> {
             message: msg.to_string(),
             code_highlights: Some(vec![CodeHighlight {
               message: None,
-              loc: SourceLocation::from(self.source_map, str_.span),
+              loc: SourceLocation::from(&self.source_map, str_.span),
             }]),
             hints: Some(vec![format!(
               "Replace with: new URL('{}', import.meta.url)",
@@ -624,7 +813,8 @@ impl<'a> Fold for DependencyCollector<'a> {
           return node;
         };
 
-        node.args[0].expr = Box::new(self.add_url_dependency(specifier, span, kind, source_type));
+        node.args[0].expr =
+          Box::new(self.add_url_dependency(specifier, span, kind, source_type, needs_stable_name));
 
         match opts {
           Some(opts) => {
@@ -638,6 +828,7 @@ impl<'a> Fold for DependencyCollector<'a> {
       }
 
       if let Some((specifier, span)) = match_str(&arg.expr) {
+        is_specifier_str = true;
         // require() calls aren't allowed in scripts, flag as an error.
         if kind == DependencyKind::Require && self.config.source_type == SourceType::Script {
           self.add_script_error(node.span);
@@ -651,6 +842,7 @@ impl<'a> Fold for DependencyCollector<'a> {
           attributes,
           kind == DependencyKind::Require && self.in_try,
           self.config.source_type,
+          false,
         );
 
         if let Some(placeholder) = placeholder {
@@ -673,13 +865,13 @@ impl<'a> Fold for DependencyCollector<'a> {
 
     // Replace import() with require()
     if kind == DependencyKind::DynamicImport {
-      let mut call = node;
-      if !self.config.scope_hoist && !self.config.standalone {
+      let mut call = node.fold_children_with(self);
+      if !self.config.scope_hoist && !self.config.standalone && is_specifier_str {
         let name = match &self.config.source_type {
           SourceType::Module => "require",
           SourceType::Script => "__parcel__require__",
         };
-        call.callee = ast::Callee::Expr(Box::new(ast::Expr::Ident(ast::Ident::new(
+        call.callee = ast::Callee::Expr(Box::new(ast::Expr::Ident(ast::Ident::new_no_ctxt(
           name.into(),
           DUMMY_SP,
         ))));
@@ -725,7 +917,7 @@ impl<'a> Fold for DependencyCollector<'a> {
       Ident(id) => {
         if id.sym == "Worker" || id.sym == "SharedWorker" {
           // Bail if defined in scope
-          self.config.is_browser && is_unresolved(&id, self.unresolved_mark)
+          self.config.is_browser() && is_unresolved(&id, self.unresolved_mark)
         } else if id.sym == "Promise" {
           // Match requires inside promises (e.g. Rollup compiled dynamic imports)
           // new Promise(resolve => resolve(require('foo')))
@@ -757,40 +949,46 @@ impl<'a> Fold for DependencyCollector<'a> {
 
     if let Some(args) = &node.args {
       if !args.is_empty() {
-        let (specifier, span) = if let Some(s) = self.match_new_url(&args[0].expr) {
-          s
-        } else if let Lit(ast::Lit::Str(str_)) = &*args[0].expr {
-          let constructor = match &*node.callee {
-            Ident(id) => id.sym.to_string(),
-            _ => "Worker".to_string(),
+        let (specifier, span, needs_stable_name) =
+          if let Some(s) = self.match_new_url(&args[0].expr) {
+            s
+          } else if let Lit(ast::Lit::Str(str_)) = &*args[0].expr {
+            let constructor = match &*node.callee {
+              Ident(id) => id.sym.to_string(),
+              _ => "Worker".to_string(),
+            };
+            self.diagnostics.push(Diagnostic {
+              message: format!(
+                "Constructing a {} with a string literal is not supported.",
+                constructor
+              ),
+              code_highlights: Some(vec![CodeHighlight {
+                message: None,
+                loc: SourceLocation::from(&self.source_map, str_.span),
+              }]),
+              hints: Some(vec![format!(
+                "Replace with: new URL('{}', import.meta.url)",
+                str_.value
+              )]),
+              show_environment: false,
+              severity: DiagnosticSeverity::Error,
+              documentation_url: Some(String::from(
+                "https://parceljs.org/languages/javascript/#web-workers",
+              )),
+            });
+            return node;
+          } else {
+            return node;
           };
-          self.diagnostics.push(Diagnostic {
-            message: format!(
-              "Constructing a {} with a string literal is not supported.",
-              constructor
-            ),
-            code_highlights: Some(vec![CodeHighlight {
-              message: None,
-              loc: SourceLocation::from(self.source_map, str_.span),
-            }]),
-            hints: Some(vec![format!(
-              "Replace with: new URL('{}', import.meta.url)",
-              str_.value
-            )]),
-            show_environment: false,
-            severity: DiagnosticSeverity::Error,
-            documentation_url: Some(String::from(
-              "https://parceljs.org/languages/javascript/#web-workers",
-            )),
-          });
-          return node;
-        } else {
-          return node;
-        };
 
         let (source_type, opts) = match_worker_type(args.get(1));
-        let placeholder =
-          self.add_url_dependency(specifier, span, DependencyKind::WebWorker, source_type);
+        let placeholder = self.add_url_dependency(
+          specifier,
+          span,
+          DependencyKind::WebWorker,
+          source_type,
+          needs_stable_name,
+        );
 
         // Replace argument with a require call to resolve the URL at runtime.
         let mut node = node.clone();
@@ -832,12 +1030,17 @@ impl<'a> Fold for DependencyCollector<'a> {
       return self.get_import_meta_url();
     }
 
-    if let Some((specifier, span)) = self.match_new_url(&node) {
+    if let Some(expr) = self.match_import_meta_prop(&node) {
+      return expr;
+    }
+
+    if let Some((specifier, span, needs_stable_name)) = self.match_new_url(&node) {
       let url = self.add_url_dependency(
         specifier,
         span,
         DependencyKind::Url,
         self.config.source_type,
+        needs_stable_name,
       );
 
       // If this is a library, we will already have a URL object. Otherwise, we need to
@@ -845,7 +1048,8 @@ impl<'a> Fold for DependencyCollector<'a> {
       if !self.config.is_library && !self.config.standalone {
         return Expr::New(NewExpr {
           span: DUMMY_SP,
-          callee: Box::new(Expr::Ident(Ident::new(js_word!("URL"), DUMMY_SP))),
+          callee: Box::new(Expr::Ident(Ident::new_no_ctxt(js_word!("URL"), DUMMY_SP))),
+          ctxt: SyntaxContext::empty(),
           args: Some(vec![ExprOrSpread {
             expr: Box::new(url),
             spread: None,
@@ -859,6 +1063,9 @@ impl<'a> Fold for DependencyCollector<'a> {
 
     let is_require = match &node {
       Expr::Ident(ident) => {
+        if ident.sym == "__parcel__import__" {
+          return ast::Expr::Ident("import".into());
+        }
         // Free `require` -> undefined
         ident.sym == js_word!("require") && is_unresolved(&ident, self.unresolved_mark)
       }
@@ -877,7 +1084,7 @@ impl<'a> Fold for DependencyCollector<'a> {
       return ast::Expr::Ident(get_undefined_ident(self.unresolved_mark));
     }
 
-    node.fold_children_with(self)
+    maybe_grow_default(|| node.fold_children_with(self))
   }
 }
 
@@ -981,7 +1188,7 @@ fn build_promise_chain(node: ast::CallExpr, require_node: ast::CallExpr) -> ast:
           f.function.params.insert(
             0,
             ast::Param {
-              pat: ast::Pat::Ident(ast::BindingIdent::from(ast::Ident::new(
+              pat: ast::Pat::Ident(ast::BindingIdent::from(ast::Ident::new_no_ctxt(
                 "res".into(),
                 DUMMY_SP,
               ))),
@@ -995,7 +1202,7 @@ fn build_promise_chain(node: ast::CallExpr, require_node: ast::CallExpr) -> ast:
           let mut f = f.clone();
           f.params.insert(
             0,
-            ast::Pat::Ident(ast::BindingIdent::from(ast::Ident::new(
+            ast::Pat::Ident(ast::BindingIdent::from(ast::Ident::new_no_ctxt(
               "res".into(),
               DUMMY_SP,
             ))),
@@ -1020,6 +1227,7 @@ fn build_promise_chain(node: ast::CallExpr, require_node: ast::CallExpr) -> ast:
                       span: DUMMY_SP,
                       arg: Some(Box::new(ast::Expr::Call(require_node.clone()))),
                     })],
+                    ctxt: SyntaxContext::empty(),
                   }),
                   params: vec![],
                   decorators: vec![],
@@ -1028,20 +1236,23 @@ fn build_promise_chain(node: ast::CallExpr, require_node: ast::CallExpr) -> ast:
                   return_type: None,
                   type_params: None,
                   span: DUMMY_SP,
+                  ctxt: SyntaxContext::empty(),
                 }),
               })),
               spread: None,
             }],
             span: DUMMY_SP,
+            ctxt: SyntaxContext::empty(),
             type_args: None,
           }))),
-          prop: MemberProp::Ident(ast::Ident::new("then".into(), DUMMY_SP)),
+          prop: MemberProp::Ident(ast::IdentName::new("then".into(), DUMMY_SP)),
         }))),
         args: vec![ast::ExprOrSpread {
           expr: Box::new(f),
           spread: None,
         }],
         span: DUMMY_SP,
+        ctxt: SyntaxContext::empty(),
         type_args: None,
       };
     }
@@ -1060,7 +1271,7 @@ fn create_url_constructor(url: ast::Expr, use_import_meta: bool) -> ast::Expr {
         kind: MetaPropKind::ImportMeta,
         span: DUMMY_SP,
       })),
-      prop: MemberProp::Ident(Ident::new(js_word!("url"), DUMMY_SP)),
+      prop: MemberProp::Ident(IdentName::new(js_word!("url"), DUMMY_SP)),
     })
   } else {
     // CJS output: "file:" + __filename
@@ -1068,13 +1279,17 @@ fn create_url_constructor(url: ast::Expr, use_import_meta: bool) -> ast::Expr {
       span: DUMMY_SP,
       left: Box::new(Expr::Lit(Lit::Str("file:".into()))),
       op: BinaryOp::Add,
-      right: Box::new(Expr::Ident(Ident::new("__filename".into(), DUMMY_SP))),
+      right: Box::new(Expr::Ident(Ident::new_no_ctxt(
+        "__filename".into(),
+        DUMMY_SP,
+      ))),
     })
   };
 
   Expr::New(NewExpr {
     span: DUMMY_SP,
-    callee: Box::new(Expr::Ident(Ident::new(js_word!("URL"), DUMMY_SP))),
+    ctxt: SyntaxContext::empty(),
+    callee: Box::new(Expr::Ident(Ident::new_no_ctxt(js_word!("URL"), DUMMY_SP))),
     args: Some(vec![
       ExprOrSpread {
         expr: Box::new(url),
@@ -1106,7 +1321,7 @@ impl Fold for PromiseTransformer {
       }
     }
 
-    swc_core::ecma::visit::fold_return_stmt(self, node)
+    node.fold_children_with(self)
   }
 
   fn fold_arrow_expr(&mut self, node: ast::ArrowExpr) -> ast::ArrowExpr {
@@ -1120,18 +1335,18 @@ impl Fold for PromiseTransformer {
       }
     }
 
-    swc_core::ecma::visit::fold_arrow_expr(self, node)
+    node.fold_children_with(self)
   }
 
   fn fold_expr(&mut self, node: ast::Expr) -> ast::Expr {
-    let node = swc_core::ecma::visit::fold_expr(self, node);
+    let node = node.fold_children_with(self);
 
     // Replace the original require node with a reference to a variable `res`,
     // which will be added as a parameter to the parent function.
     if let ast::Expr::Call(call) = &node {
       if let Some(require_node) = &self.require_node {
         if require_node == call {
-          return ast::Expr::Ident(ast::Ident::new("res".into(), DUMMY_SP));
+          return ast::Expr::Ident(ast::Ident::new_no_ctxt("res".into(), DUMMY_SP));
         }
       }
     }
@@ -1141,7 +1356,7 @@ impl Fold for PromiseTransformer {
 }
 
 impl<'a> DependencyCollector<'a> {
-  fn match_new_url(&mut self, expr: &ast::Expr) -> Option<(JsWord, swc_core::common::Span)> {
+  fn match_new_url(&mut self, expr: &ast::Expr) -> Option<(JsWord, swc_core::common::Span, bool)> {
     use ast::*;
 
     if let Expr::New(new) = expr {
@@ -1163,8 +1378,28 @@ impl<'a> DependencyCollector<'a> {
 
         if let Some(arg) = args.get(1) {
           if self.is_import_meta_url(&arg.expr) {
-            return Some((specifier, span));
+            return Some((specifier, span, false));
           }
+        }
+      }
+    }
+
+    if let Expr::Call(call) = expr {
+      if let Callee::Expr(expr) = &call.callee {
+        if matches!(&**expr, Expr::Ident(id) if id.sym == "__parcel_url_dep__") {
+          let (specifier, span) = if let Some(arg) = call.args.first() {
+            match_str(&arg.expr)?
+          } else {
+            return None;
+          };
+
+          let needs_stable_name = if let Some(arg) = call.args.get(1) {
+            matches!(&*arg.expr, Expr::Lit(Lit::Bool(Bool { value: true, .. })))
+          } else {
+            false
+          };
+
+          return Some((specifier, span, needs_stable_name));
         }
       }
     }
@@ -1177,7 +1412,7 @@ impl<'a> DependencyCollector<'a> {
         Expr::Member(member) => member.span,
         _ => unreachable!(),
       };
-      return Some((specifier.into(), span));
+      return Some((specifier.into(), span, false));
     }
 
     None
@@ -1234,7 +1469,7 @@ impl<'a> DependencyCollector<'a> {
             message: "`import.meta` is not supported outside a module.".to_string(),
             code_highlights: Some(vec![CodeHighlight {
               message: None,
-              loc: SourceLocation::from(self.source_map, *span),
+              loc: SourceLocation::from(&self.source_map, *span),
             }]),
             hints: None,
             show_environment: true,
@@ -1246,7 +1481,78 @@ impl<'a> DependencyCollector<'a> {
         }
         true
       }
+      Expr::Member(member) => {
+        match_member_expr(member, vec!["parcelRequire", "meta"], self.unresolved_mark)
+      }
       _ => false,
+    }
+  }
+
+  fn match_import_meta_prop(&mut self, expr: &ast::Expr) -> Option<ast::Expr> {
+    use ast::*;
+
+    match expr {
+      Expr::Member(member) => {
+        if !self.is_import_meta(&member.obj) {
+          return None;
+        }
+
+        let name = match_property_name(member);
+
+        if let Some((name, span)) = name {
+          match name.as_str() {
+            "distDir" => {
+              self.helpers |= Helpers::DIST_DIR;
+              if self.config.scope_hoist {
+                Some(Expr::Ident(Ident::new_no_ctxt(
+                  "$parcel$distDir".into(),
+                  span,
+                )))
+              } else {
+                Some(Expr::Member(member_expr!(
+                  Default::default(),
+                  span,
+                  module.bundle.distDir
+                )))
+              }
+            }
+            "publicUrl" => {
+              self.helpers |= Helpers::PUBLIC_URL;
+              if self.config.scope_hoist {
+                Some(Expr::Ident(Ident::new_no_ctxt(
+                  "$parcel$publicUrl".into(),
+                  span,
+                )))
+              } else {
+                Some(Expr::Member(member_expr!(
+                  Default::default(),
+                  span,
+                  module.bundle.publicUrl
+                )))
+              }
+            }
+            "devServer" => {
+              self.helpers |= Helpers::DEV_SERVER;
+              if self.config.scope_hoist {
+                Some(Expr::Ident(Ident::new_no_ctxt(
+                  "$parcel$devServer".into(),
+                  span,
+                )))
+              } else {
+                Some(Expr::Member(member_expr!(
+                  Default::default(),
+                  span,
+                  module.bundle.devServer
+                )))
+              }
+            }
+            _ => None,
+          }
+        } else {
+          None
+        }
+      }
+      _ => None,
     }
   }
 
@@ -1280,9 +1586,9 @@ impl<'a> DependencyCollector<'a> {
     } else {
       // Declares a variable at the top of the module:
       // var import_meta = Object.assign(Object.create(null), {url: 'file:///src/foo.js'});
-      let ident = Ident::new(
+      let ident = Ident::new_private(
         format!("${}$import_meta", self.config.module_id).into(),
-        DUMMY_SP.apply_mark(Mark::fresh(Mark::root())),
+        DUMMY_SP,
       );
       self.import_meta = Some(VarDecl {
         kind: VarDeclKind::Var,
@@ -1292,16 +1598,22 @@ impl<'a> DependencyCollector<'a> {
           name: Pat::Ident(BindingIdent::from(ident.clone())),
           init: Some(Box::new(Expr::Call(CallExpr {
             callee: Callee::Expr(Box::new(Expr::Member(MemberExpr {
-              obj: Box::new(Expr::Ident(Ident::new(js_word!("Object"), DUMMY_SP))),
-              prop: MemberProp::Ident(Ident::new("assign".into(), DUMMY_SP)),
+              obj: Box::new(Expr::Ident(Ident::new_no_ctxt(
+                js_word!("Object"),
+                DUMMY_SP,
+              ))),
+              prop: MemberProp::Ident(IdentName::new("assign".into(), DUMMY_SP)),
               span: DUMMY_SP,
             }))),
             args: vec![
               ExprOrSpread {
                 expr: Box::new(Expr::Call(CallExpr {
                   callee: Callee::Expr(Box::new(Expr::Member(MemberExpr {
-                    obj: (Box::new(Expr::Ident(Ident::new(js_word!("Object"), DUMMY_SP)))),
-                    prop: MemberProp::Ident(Ident::new("create".into(), DUMMY_SP)),
+                    obj: (Box::new(Expr::Ident(Ident::new_no_ctxt(
+                      js_word!("Object"),
+                      DUMMY_SP,
+                    )))),
+                    prop: MemberProp::Ident(IdentName::new("create".into(), DUMMY_SP)),
                     span: DUMMY_SP,
                   }))),
                   args: vec![ExprOrSpread {
@@ -1309,6 +1621,7 @@ impl<'a> DependencyCollector<'a> {
                     spread: None,
                   }],
                   span: DUMMY_SP,
+                  ctxt: SyntaxContext::empty(),
                   type_args: None,
                 })),
                 spread: None,
@@ -1316,7 +1629,7 @@ impl<'a> DependencyCollector<'a> {
               ExprOrSpread {
                 expr: Box::new(Expr::Object(ObjectLit {
                   props: vec![PropOrSpread::Prop(Box::new(Prop::KeyValue(KeyValueProp {
-                    key: PropName::Ident(Ident::new(js_word!("url"), DUMMY_SP)),
+                    key: PropName::Ident(IdentName::new(js_word!("url"), DUMMY_SP)),
                     value: Box::new(self.get_import_meta_url()),
                   })))],
                   span: DUMMY_SP,
@@ -1325,11 +1638,13 @@ impl<'a> DependencyCollector<'a> {
               },
             ],
             span: DUMMY_SP,
+            ctxt: SyntaxContext::empty(),
             type_args: None,
           }))),
           span: DUMMY_SP,
           definite: false,
         }],
+        ctxt: SyntaxContext::empty(),
       });
       Expr::Ident(ident)
     }
@@ -1358,7 +1673,7 @@ fn match_worker_type(expr: Option<&ast::ExprOrSpread>) -> (SourceType, Option<as
           };
 
           match &kv.key {
-            PropName::Ident(Ident { sym, .. }) if sym == "type" => {}
+            PropName::Ident(IdentName { sym, .. }) if sym == "type" => {}
             PropName::Str(Str { value, .. }) if value == "type" => {}
             _ => return true,
           };
@@ -1399,4 +1714,692 @@ fn match_worker_type(expr: Option<&ast::ExprOrSpread>) -> (SourceType, Option<as
   }
 
   (SourceType::Script, expr.cloned())
+}
+
+#[cfg(test)]
+mod test {
+  use super::*;
+  use crate::{
+    test_utils::{run_fold, RunTestContext, RunVisitResult},
+    DependencyDescriptor,
+  };
+
+  fn make_dependency_collector<'a>(
+    context: RunTestContext,
+    items: &'a mut Vec<DependencyDescriptor>,
+    diagnostics: &'a mut Vec<Diagnostic>,
+    config: &'a Config,
+  ) -> DependencyCollector<'a> {
+    DependencyCollector {
+      source_map: context.source_map.clone(),
+      items,
+      in_try: false,
+      in_promise: false,
+      require_node: None,
+      ignore_mark: Mark::new(),
+      unresolved_mark: context.unresolved_mark,
+      config,
+      diagnostics,
+      import_meta: None,
+      helpers: Helpers::empty(),
+    }
+  }
+
+  fn make_config() -> Config {
+    Config::default()
+  }
+
+  fn make_placeholder_hash(specifier: &str, dependency_kind: DependencyKind) -> String {
+    format!(
+      "{:x}",
+      hash!(format!("{}:{}:{}", "", specifier, dependency_kind))
+    )
+  }
+
+  #[test]
+  fn test_dynamic_import_dependency() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = Config::default();
+    let input_code = r#"
+      const { x } = await import('other');
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("other", DependencyKind::DynamicImport);
+    let expected_code = format!(
+      r#"
+      const {{ x }} = await require("{}");
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::DynamicImport,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  #[test]
+  fn test_import_dependency() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = Config::default();
+    let input_code = r#"
+      import { x } from 'other';
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let expected_code = r#"
+      import { x } from 'other';
+    "#
+    .trim_start()
+    .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::Import,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: None,
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  #[test]
+  fn test_export_dependency() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = Config::default();
+    let input_code = r#"
+      export { x } from 'other';
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let expected_code = r#"
+      export { x } from 'other';
+    "#
+    .trim_start()
+    .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::Export,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: None,
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  #[test]
+  fn test_export_star_dependency() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = Config::default();
+    let input_code = r#"
+      export * from 'other';
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let expected_code = r#"
+      export * from 'other';
+    "#
+    .trim_start()
+    .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::Export,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: None,
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  #[test]
+  fn test_require_dependency() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = make_config();
+    let input_code = r#"
+      const { x } = require('other');
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("other", DependencyKind::Require);
+    let expected_code = format!(
+      r#"
+      const {{ x }} = require("{}");
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::Require,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  #[test]
+  fn test_optional_require_dependency() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = make_config();
+    let input_code = r#"
+try {
+    const { x } = require('other');
+} catch (err) {}
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("other", DependencyKind::Require);
+    let expected_code = format!(
+      r#"
+try {{
+    const {{ x }} = require("{}");
+}} catch (err) {{}}
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::Require,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::OPTIONAL,
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  // Require is treated as dynamic import
+  #[test]
+  fn test_compiled_dynamic_imports() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = make_config();
+    let input_code = r#"
+Promise.resolve().then(() => require('other'));
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("other", DependencyKind::DynamicImport);
+    let expected_code = format!(
+      r#"
+Promise.resolve().then(()=>require("{}"));
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::DynamicImport,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  // Require is treated as dynamic import
+  #[test]
+  fn test_compiled_dynamic_imports_with_chain() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = make_config();
+    let input_code = r#"
+Promise.resolve().then(() => doSomething(require('other')));
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("other", DependencyKind::DynamicImport);
+    let expected_code = format!(
+      r#"
+Promise.resolve().then(function() {{
+    return require("{}");
+}}).then((res)=>doSomething(res));
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::DynamicImport,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  // Require is treated as dynamic import
+  #[test]
+  fn test_compiled_dynamic_imports_with_function_chain() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = make_config();
+    let input_code = r#"
+Promise.resolve().then(function() { return doSomething(require('other')); });
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("other", DependencyKind::DynamicImport);
+    let expected_code = format!(
+      r#"
+Promise.resolve().then(function() {{
+    return require("{}");
+}}).then(function(res) {{
+    return doSomething(res);
+}});
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::DynamicImport,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  // Require is treated as dynamic import
+  #[test]
+  fn test_new_promise_require_imports() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = make_config();
+    let input_code = r#"
+new Promise((resolve) => resolve(require("other")));
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("other", DependencyKind::DynamicImport);
+    let expected_code = format!(
+      r#"
+new Promise((resolve)=>resolve(require("{}")));
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::DynamicImport,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  // Require is treated as dynamic import
+  #[test]
+  fn test_new_promise_require_imports_with_function_expr() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = make_config();
+    let input_code = r#"
+new Promise(function(resolve) { return resolve(require("other")) });
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("other", DependencyKind::DynamicImport);
+    let expected_code = format!(
+      r#"
+new Promise(function(resolve) {{
+    return resolve(require("{}"));
+}});
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::DynamicImport,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  // Require is treated as dynamic import
+  #[test]
+  fn test_promise_resolve_require_dynamic_import() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = make_config();
+    let input_code = r#"
+Promise.resolve(require("other"));
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("other", DependencyKind::DynamicImport);
+    let expected_code = format!(
+      r#"
+Promise.resolve(require("{}"));
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::DynamicImport,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  #[test]
+  fn test_worker_dependency() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = make_config();
+    let input_code = r#"
+      new Worker(new URL('other', import.meta.url), {type: 'module'});
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("other", DependencyKind::WebWorker);
+    let expected_code = format!(
+      r#"
+      new Worker(require("{}"));
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::WebWorker,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  #[test]
+  fn test_service_worker_dependency() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = make_config();
+    let input_code = r#"
+      navigator.serviceWorker.register(new URL('other', import.meta.url), {type: 'module'});
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("other", DependencyKind::ServiceWorker);
+    let expected_code = format!(
+      r#"
+      navigator.serviceWorker.register(require("{}"));
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::ServiceWorker,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  #[test]
+  fn test_worklet_dependency() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = make_config();
+    let input_code = r#"
+      CSS.paintWorklet.addModule(new URL('other', import.meta.url));
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("other", DependencyKind::Worklet);
+    let expected_code = format!(
+      r#"
+      CSS.paintWorklet.addModule(require("{}"));
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::Worklet,
+        specifier: "other".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
+
+  #[test]
+  fn test_url_dependency() {
+    let mut items = vec![];
+    let mut diagnostics = vec![];
+    let config = make_config();
+    let input_code = r#"
+let img = document.createElement('img');
+img.src = new URL('hero.jpg', import.meta.url);
+document.body.appendChild(img);
+    "#;
+
+    let RunVisitResult { output_code, .. } = run_fold(input_code, |context| {
+      make_dependency_collector(context, &mut items, &mut diagnostics, &config)
+    });
+
+    let hash = make_placeholder_hash("hero.jpg", DependencyKind::Url);
+    let expected_code = format!(
+      r#"
+let img = document.createElement('img');
+img.src = new URL(require("{}"));
+document.body.appendChild(img);
+    "#,
+      hash
+    );
+    let expected_code = expected_code
+      .trim_start()
+      .trim_end_matches(|p: char| p == ' ');
+
+    assert_eq!(output_code, expected_code);
+    assert_eq!(diagnostics, []);
+    assert_eq!(
+      items,
+      [DependencyDescriptor {
+        kind: DependencyKind::Url,
+        specifier: "hero.jpg".into(),
+        attributes: None,
+        flags: DependencyFlags::empty(),
+        source_type: Some(SourceType::Module),
+        placeholder: Some(hash),
+        ..items[0].clone()
+      }]
+    );
+  }
 }
